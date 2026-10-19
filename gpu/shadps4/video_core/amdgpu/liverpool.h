@@ -453,6 +453,24 @@ private:
     std::array<u64, (NumRegChunks + 63) / 64> dirty_chunks{};
     std::vector<u16> dirty_list;
     std::jthread back_thread{};
+
+    // sotc: SOTC_COMPUTE_PRESCAN=1: each submitted command buffer is walked ahead of the command
+    // processor, tracking the compute registers; at a dispatch of a compute shader not seen yet,
+    // its translation and pipeline are queued for the pipeline workers (PipelineCache::
+    // PrefetchCompute). The command processor reaches it ~0.4 s later on average when shaders are new.
+    struct PrescanItem {
+        std::span<const u32> cb;
+        u32 queue;
+    };
+    void PrescanSubmit(std::span<const u32> cb, u32 queue);
+    void PrescanLoop(std::stop_token token);
+    void PrescanBuffer(std::span<const u32> cb, u32 queue, int depth);
+    bool prescan_enabled{};
+    std::mutex prescan_mutex;
+    std::condition_variable_any prescan_cv;
+    std::deque<PrescanItem> prescan_queue;
+    std::array<ComputeProgram, NumTotalQueues> prescan_cs{};
+    std::jthread prescan_thread{};
 };
 
 } // namespace AmdGpu

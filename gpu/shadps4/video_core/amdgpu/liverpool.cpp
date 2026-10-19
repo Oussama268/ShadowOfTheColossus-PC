@@ -7,6 +7,7 @@
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
+#include "common/assert_scope.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -86,6 +87,11 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     back_threaded = !threads || threads[0] != '0';
     const char* strict = std::getenv("SOTC_CP_STRICT");
     back_strict = strict && strict[0] == '1';
+    const char* prescan = std::getenv("SOTC_COMPUTE_PRESCAN");
+    prescan_enabled = prescan && prescan[0] == '1';
+    if (prescan_enabled) {
+        prescan_thread = std::jthread{[this](std::stop_token token) { PrescanLoop(token); }};
+    }
     if (back_threaded) {
         back_ring.resize(BackRingSize);
         dirty_list.reserve(NumRegChunks);
@@ -96,6 +102,10 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
 }
 
 Liverpool::~Liverpool() {
+    if (prescan_thread.joinable()) {
+        prescan_thread.request_stop();
+        prescan_thread.join();
+    }
     process_thread.request_stop();
     process_thread.join();
     if (back_thread.joinable()) {
@@ -1685,6 +1695,94 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
     return std::make_pair(dcb, ccb);
 }
 
+void Liverpool::PrescanSubmit(std::span<const u32> cb, u32 queue) {
+    {
+        std::scoped_lock lock{prescan_mutex};
+        prescan_queue.push_back({cb, queue});
+    }
+    prescan_cv.notify_one();
+}
+
+void Liverpool::PrescanLoop(std::stop_token token) {
+    Common::SetCurrentThreadName("shadPS4:ComputePrescan");
+    // A garbage register value (stale state, a buffer not written yet) must not stop the port.
+    Common::g_assert_throws = true;
+    for (;;) {
+        PrescanItem item;
+        {
+            std::unique_lock lock{prescan_mutex};
+            prescan_cv.wait(lock, token, [this] { return !prescan_queue.empty(); });
+            if (token.stop_requested()) {
+                return;
+            }
+            item = prescan_queue.front();
+            prescan_queue.pop_front();
+        }
+        try {
+            PrescanBuffer(item.cb, item.queue, 0);
+        } catch (const Common::AssertFailure&) {
+        }
+    }
+}
+
+/// Reads packets through the memory backing (never faults on GPU-tracked pages). Stops at
+/// anything it does not know how to skip; only an estimate is needed.
+void Liverpool::PrescanBuffer(std::span<const u32> cb, u32 queue, int depth) {
+    auto* memory = Core::Memory::Instance();
+    const VAddr base = reinterpret_cast<VAddr>(cb.data());
+    const u8* backing = memory->GetBackingPointer(base);
+    if (!backing || cb.empty() || !memory->IsValidMapping(base, cb.size_bytes())) {
+        return;
+    }
+    const u32* words = reinterpret_cast<const u32*>(backing);
+    auto& cs = prescan_cs[queue];
+    size_t pos = 0;
+    while (pos < cb.size()) {
+        const auto* header = reinterpret_cast<const PM4Header*>(words + pos);
+        if (header->type == 2) {
+            ++pos;
+            continue;
+        }
+        if (header->type != 3) {
+            return;
+        }
+        const u32 count = header->type3.NumWords();
+        if (pos + count + 1 > cb.size()) {
+            return;
+        }
+        switch (header->type3.opcode) {
+        case PM4ItOpcode::SetShReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            const u32 set_dwords = count - 1;
+            if (set_data->reg_offset >= 0x200 &&
+                set_data->reg_offset + set_dwords <= 0x200 + sizeof(ComputeProgram) / 4) {
+                std::memcpy(reinterpret_cast<u32*>(&cs) + (set_data->reg_offset - 0x200),
+                            words + pos + 2, set_dwords * sizeof(u32));
+            }
+            break;
+        }
+        case PM4ItOpcode::DispatchDirect:
+        case PM4ItOpcode::DispatchIndirect:
+            if (rasterizer) {
+                rasterizer->GetPipelineCache().PrefetchCompute(cs);
+            }
+            break;
+        case PM4ItOpcode::IndirectBuffer: {
+            const auto* ib = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            if (depth < 2) {
+                PrescanBuffer({ib->Address<const u32>(), ib->ib_size}, queue, depth + 1);
+            }
+            break;
+        }
+        case PM4ItOpcode::Rewind:
+            return; // ring contents after this may not be written yet
+        default:
+            break;
+        }
+        pos += count + 1;
+    }
+}
+
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
@@ -1696,6 +1794,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+    }
+    if (prescan_enabled) {
+        PrescanSubmit(dcb, GfxQueueId);
     }
 
     std::scoped_lock lk{submit_mutex};
@@ -1712,6 +1813,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+    }
+    if (prescan_enabled) {
+        PrescanSubmit(acb, gnm_vqid);
     }
 
     std::scoped_lock lk{submit_mutex};

@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include "common/elf_info.h"
 #include "common/assert_scope.h"
+#include "core/memory.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -482,7 +483,8 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
         std::unique_ptr<AsyncPipelineJob> job;
         {
             std::unique_lock lock{async_mutex};
-            async_cv.wait(lock, token, [this] { return !async_queue.empty(); });
+            async_cv.wait(lock, token,
+                          [this] { return !async_queue.empty() || !prefetch_queue.empty(); });
             if (token.stop_requested()) {
                 // A queued compute pipeline may be waited for by the recording thread: build
                 // those before leaving.
@@ -495,19 +497,34 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                 }
                 return;
             }
-            job = std::move(async_queue.front());
-            async_queue.pop_front();
-            if (job->compute) {
-                --async_compute_queued;
-            } else if (job->translate) {
-                --async_translate_queued;
+            if (!prefetch_queue.empty()) {
+                job = std::move(prefetch_queue.front());
+                prefetch_queue.pop_front();
+            } else {
+                job = std::move(async_queue.front());
+                async_queue.pop_front();
+                if (job->compute) {
+                    --async_compute_queued;
+                } else if (job->translate) {
+                    --async_translate_queued;
+                }
             }
         }
         if (job->translate) {
             RunAsyncTranslate(*job->translate);
-            std::scoped_lock lock{async_mutex};
-            async_done.push_back(std::move(job));
-            async_done_count.fetch_add(1, std::memory_order_release);
+            const bool prefetch = job->translate->prefetch;
+            const u64 hash = job->translate->hash;
+            {
+                std::scoped_lock lock{async_mutex};
+                async_done.push_back(std::move(job));
+                async_done_count.fetch_add(1, std::memory_order_release);
+                if (prefetch) {
+                    prefetch_inflight.erase(hash);
+                }
+            }
+            if (prefetch) {
+                prefetch_done_cv.notify_all();
+            }
             continue;
         }
         if (job->compute) {
@@ -554,13 +571,96 @@ void PipelineCache::CollectAsyncPipelines() {
     }
 }
 
+void PipelineCache::PrefetchCompute(const AmdGpu::ComputeProgram& cs) {
+    const auto* code = cs.Address<const u32*>();
+    if (!code || async_workers.empty()) {
+        return;
+    }
+    auto* memory = Core::Memory::Instance();
+    const VAddr address = reinterpret_cast<VAddr>(code);
+    const u8* backing = memory->GetBackingPointer(address);
+    if (!backing || !memory->IsValidMapping(address, 64)) {
+        return;
+    }
+    // The command processor's binary info cache is not thread-safe: search the backing.
+    const auto& bininfo = AmdGpu::SearchBinaryInfo(reinterpret_cast<const u32*>(backing));
+    const u64 hash = bininfo.shader_hash;
+    {
+        std::scoped_lock lock{prefetch_mutex};
+        if (!prefetch_known.insert(hash).second) {
+            return;
+        }
+    }
+    const Shader::ShaderParams params{
+        .user_data = cs.user_data,
+        .code = std::span{code, bininfo.length / sizeof(u32)},
+        .hash = hash,
+    };
+    Shader::RuntimeInfo rt{};
+    rt.Initialize(HwStage::Compute, SwStage::Compute);
+    rt.props.num_user_data = cs.settings.num_user_regs;
+    rt.props.num_allocated_vgprs = cs.settings.num_vgprs * 4;
+    rt.props.fp_denorm_mode32 = cs.settings.fp_denorm_mode32;
+    rt.props.fp_denorm_mode16_64 = cs.settings.fp_denorm_mode64;
+    rt.props.fp_round_mode32 = cs.settings.fp_round_mode32;
+    rt.props.fp_round_mode16_64 = cs.settings.fp_round_mode64;
+    rt.hw.cs.workgroup_size = {cs.num_thread_x.full, cs.num_thread_y.full, cs.num_thread_z.full};
+    rt.hw.cs.tgid_enable = {cs.IsTgidEnabled(0), cs.IsTgidEnabled(1), cs.IsTgidEnabled(2)};
+    rt.hw.cs.shared_memory_size = cs.SharedMemSize();
+    {
+        std::scoped_lock lock{async_mutex};
+        prefetch_inflight.insert(hash);
+    }
+    QueueAsyncTranslate(HwStage::Compute, SwStage::Compute, params, rt, {}, nullptr, nullptr, 0,
+                        true);
+    SotcStats::prefetch_queued.fetch_add(1, std::memory_order_relaxed);
+}
+
+/// Command processor: a compute shader the prescan queued. A job no worker started is taken
+/// and run here; one in progress is waited for. Either way it is installed when this returns.
+void PipelineCache::WaitForPrefetch(u64 hash) {
+    std::unique_ptr<AsyncPipelineJob> taken;
+    {
+        std::unique_lock lock{async_mutex};
+        if (!prefetch_inflight.contains(hash)) {
+            return;
+        }
+        const auto it = std::ranges::find_if(prefetch_queue, [hash](const auto& job) {
+            return job->translate->hash == hash;
+        });
+        if (it != prefetch_queue.end()) {
+            taken = std::move(*it);
+            prefetch_queue.erase(it);
+            prefetch_inflight.erase(hash);
+        } else {
+            const auto start = std::chrono::steady_clock::now();
+            prefetch_done_cv.wait(lock, [&] { return !prefetch_inflight.contains(hash); });
+            SotcStats::prefetch_wait_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count(),
+                std::memory_order_relaxed);
+            SotcStats::prefetch_waited.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (taken) {
+        SotcStats::prefetch_taken.fetch_add(1, std::memory_order_relaxed);
+        RunAsyncTranslate(*taken->translate);
+        InstallTranslation(*taken->translate);
+        return;
+    }
+    CollectAsyncPipelines();
+}
+
 void PipelineCache::QueueAsyncTranslate(HwStage hw_stage, SwStage sw_stage,
                                         const Shader::ShaderParams& params,
                                         const Shader::RuntimeInfo& rt,
                                         const Shader::Backend::Bindings& start, Program* program,
-                                        const Shader::StageSpecialization* spec, size_t perm_idx) {
+                                        const Shader::StageSpecialization* spec, size_t perm_idx,
+                                        bool prefetch) {
     auto job = std::make_unique<AsyncPipelineJob>();
     auto& t = *(job->translate = std::make_unique<AsyncPipelineJob::Translate>());
+    t.prefetch = prefetch;
     t.hw_stage = hw_stage;
     t.sw_stage = sw_stage;
     t.hash = params.hash;
@@ -577,8 +677,13 @@ void PipelineCache::QueueAsyncTranslate(HwStage hw_stage, SwStage sw_stage,
     }
     {
         std::scoped_lock lock{async_mutex};
-        async_queue.insert(async_queue.begin() + async_compute_queued + async_translate_queued++,
-                           std::move(job));
+        if (prefetch) {
+            prefetch_queue.push_back(std::move(job));
+        } else {
+            async_queue.insert(async_queue.begin() + async_compute_queued +
+                                   async_translate_queued++,
+                               std::move(job));
+        }
     }
     async_cv.notify_one();
 }
@@ -595,9 +700,30 @@ void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
     auto runtime_info = t.runtime_info;
     // The tables the user data points to may already hold the game's next data: a translation
     // that asserts on what it read gives the shader back to the command processor.
+    const bool was_throwing = Common::g_assert_throws;
     Common::g_assert_throws = true;
     try {
         TranslateOnWorker(t, params, binding, runtime_info, worker_pools);
+        if (t.prefetch && t.new_program) {
+            // The pipeline of the new program's first permutation (its key on the CP): deferred,
+            // built by a worker from the compute part of the queue; a bind waits for it (or the
+            // recorder builds it). The command processor only waits for the translation.
+            const ComputePipelineKey key{HashCombine(t.hash, 0)};
+            const bool deferred = scheduler.HasRecordThread();
+            t.compute_pipeline = std::make_unique<ComputePipeline>(
+                instance, scheduler, desc_heap, profile, *pipeline_cache, key,
+                t.new_program->info, t.module, t.compute_sdata, false, deferred);
+            if (deferred) {
+                auto build = std::make_unique<AsyncPipelineJob>();
+                build->compute = t.compute_pipeline.get();
+                {
+                    std::scoped_lock lock{async_mutex};
+                    async_queue.insert(async_queue.begin() + async_compute_queued++,
+                                       std::move(build));
+                }
+                async_cv.notify_one();
+            }
+        }
     } catch (const Common::AssertFailure&) {
         t.failed = true;
         t.new_program.reset();
@@ -605,8 +731,9 @@ void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
             instance.GetDevice().destroyShaderModule(t.module);
             t.module = vk::ShaderModule{};
         }
+        t.compute_pipeline.reset();
     }
-    Common::g_assert_throws = false;
+    Common::g_assert_throws = was_throwing;
     SotcStats::async_translate_built.fetch_add(1, std::memory_order_relaxed);
     SotcStats::async_translate_ns.fetch_add(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
@@ -648,7 +775,13 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
         auto [it, is_new] = program_cache.try_emplace(t.hash);
         if (!is_new) {
             // Translated meanwhile on the command processor (by a draw that may not wait).
-            instance.GetDevice().destroyShaderModule(t.module);
+            if (t.compute_pipeline) {
+                // A worker may be building it, from this program's info and module: both kept.
+                discarded_prefetch.push_back(std::move(t.compute_pipeline));
+                discarded_programs.push_back(std::move(t.new_program));
+            } else {
+                instance.GetDevice().destroyShaderModule(t.module);
+            }
             return;
         }
         it.value() = std::move(t.new_program);
@@ -657,6 +790,19 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
         RegisterShaderMeta(program->info, t.spec->fetch_shader_data, *t.spec,
                            HashCombine(t.hash, 0), 0);
         program->AddPermut(t.module, std::move(*t.spec));
+        if (t.compute_pipeline) {
+            const ComputePipelineKey key{HashCombine(t.hash, 0)};
+            const auto [pit, pipeline_new] = compute_pipelines.try_emplace(key);
+            if (pipeline_new) {
+                pit.value() = std::move(t.compute_pipeline);
+                RegisterPipelineData(key, t.compute_sdata);
+                ++num_new_pipelines;
+                SotcStats::prefetch_pipelines.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // A worker may still build it: kept alive (rare).
+                discarded_prefetch.push_back(std::move(t.compute_pipeline));
+            }
+        }
         // The user data seen by the worker goes away with the job; every lookup sets its own.
         program->info.UserData() = {};
         return;
@@ -762,6 +908,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    if (async_done_count.load(std::memory_order_acquire) != 0) {
+        CollectAsyncPipelines();
+    }
     if (!RefreshComputeKey()) {
         return nullptr;
     }
@@ -1036,6 +1185,9 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    if (!program_cache.contains(cs_params.hash)) {
+        WaitForPrefetch(cs_params.hash);
+    }
     std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
     return true;

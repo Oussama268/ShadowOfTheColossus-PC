@@ -177,6 +177,10 @@ private:
             std::unique_ptr<Program> new_program;
             vk::ShaderModule module{};
             std::vector<u32> spv;
+            bool prefetch{}; ///< queued by the compute prescan (PrefetchCompute)
+            bool cp_ran{};   ///< the command processor took it before a worker did
+            std::unique_ptr<ComputePipeline> compute_pipeline; ///< prefetch: built on the worker
+            ComputePipeline::SerializationSupport compute_sdata{};
             bool stale{}; ///< the worker's specialization differs from spec (permutation)
             bool failed{}; ///< translation asserted (tables reused by the game meanwhile)
         };
@@ -187,8 +191,24 @@ private:
     void QueueAsyncTranslate(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                              const Shader::ShaderParams& params, const Shader::RuntimeInfo& rt,
                              const Shader::Backend::Bindings& start, Program* program,
-                             const Shader::StageSpecialization* spec, size_t perm_idx);
+                             const Shader::StageSpecialization* spec, size_t perm_idx,
+                             bool prefetch = false);
     void RunAsyncTranslate(AsyncPipelineJob::Translate& job);
+public:
+    /// sotc: compute prescan thread (liverpool.cpp): queue a new compute shader's translation and
+    /// pipeline for the workers. Thread-safe.
+    void PrefetchCompute(const AmdGpu::ComputeProgram& cs);
+private:
+    void WaitForPrefetch(u64 hash);
+    std::mutex prefetch_mutex;
+    std::unordered_set<u64> prefetch_known;    ///< hashes prefetched or translated
+    std::unordered_set<u64> prefetch_inflight; ///< prefetch jobs queued or running (async_mutex)
+    std::condition_variable_any prefetch_done_cv;
+    /// Prescan translations, served before everything else (a few ms each): the command
+    /// processor reaches their dispatch ~0.4 s after the prescan, behind slow driver compiles.
+    std::deque<std::unique_ptr<AsyncPipelineJob>> prefetch_queue; ///< under async_mutex
+    std::vector<std::unique_ptr<ComputePipeline>> discarded_prefetch; ///< CP only
+    std::vector<std::unique_ptr<Program>> discarded_programs;           ///< CP only
     void TranslateOnWorker(AsyncPipelineJob::Translate& job, const Shader::ShaderParams& params,
                            Shader::Backend::Bindings& binding, Shader::RuntimeInfo& runtime_info,
                            Shader::Pools& worker_pools);

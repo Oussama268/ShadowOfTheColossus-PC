@@ -87,6 +87,9 @@ inline std::atomic<uint64_t> async_translate_stale{0}; ///< permutations whose t
 inline std::atomic<uint64_t> async_translate_built{0};
 inline std::atomic<uint64_t> async_translate_ns{0};    ///< worker time translating them
 inline std::atomic<uint64_t> async_translate_skips{0}; ///< draws skipped while waiting for one
+// sotc: compute prescan (SOTC_COMPUTE_PRESCAN), totals.
+inline std::atomic<uint64_t> prefetch_queued{0}, prefetch_pipelines{0}, prefetch_taken{0},
+    prefetch_waited{0}, prefetch_wait_ns{0};
 /// sotc: SRT walker loads that faulted (null or unmapped table pointer) and read zero, total.
 inline std::atomic<uint64_t> srt_walker_faults{0};
 inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images

@@ -530,6 +530,16 @@ void VideoOutDriver::Flip(const Request& req) {
                         SotcStats::async_compute_waits.load(std::memory_order_relaxed)),
                     SotcStats::async_compute_wait_ns.load(std::memory_order_relaxed) / 1e6);
             }
+            if (const uint64_t queued = SotcStats::prefetch_queued.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "SOTC PRESCAN %llu compute shaders queued, %llu pipelines installed, "
+                             "%llu taken by the CP, %llu waited (%.0f ms)\n",
+                             static_cast<unsigned long long>(queued),
+                             static_cast<unsigned long long>(SotcStats::prefetch_pipelines.load()),
+                             static_cast<unsigned long long>(SotcStats::prefetch_taken.load()),
+                             static_cast<unsigned long long>(SotcStats::prefetch_waited.load()),
+                             SotcStats::prefetch_wait_ns.load() / 1e6);
+            }
             // sotc: graphics shaders translated by workers (SOTC_ASYNC_TRANSLATE), totals.
             if (const uint64_t built =
                     SotcStats::async_translate_built.load(std::memory_order_relaxed)) {
