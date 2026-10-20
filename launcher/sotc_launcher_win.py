@@ -31,7 +31,7 @@ CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launcher'
 CONFIG_FILE = CONFIG_DIR / 'settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.57-opt8'
+VERSION = '0.59'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -64,7 +64,8 @@ def run_role(argv):
     # encode character '™'", issue #45); the frozen executable ignores PYTHONIOENCODING.
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+            # UTF-8 whatever the Windows code page (gbk etc. cannot print the game title's ™).
+            stream.reconfigure(line_buffering=True, encoding='utf-8', errors='replace')
         except (AttributeError, ValueError):
             pass
     if argv[0] == '--script':
@@ -88,10 +89,28 @@ def run_command():
 # Texts: Portuguese first, English for every other Windows language.
 
 LANG = 'pt'
+# Spanish, Chinese (Simplified), Korean and Russian are looked up by the Portuguese text
+# (launcher/sotc_i18n.py); a text missing there shows in English.
+try:
+    from sotc_i18n import TRANSLATIONS
+except ImportError:
+    TRANSLATIONS = {}
 
 
 def _(pt, en):
-    return pt if LANG == 'pt' else en
+    if LANG == 'pt':
+        return pt
+    table = TRANSLATIONS.get(LANG)
+    return table.get(pt, en) if table else en
+
+
+def ui_font():
+    """Interface font: Segoe UI has no Chinese or Korean characters."""
+    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, 'Segoe UI')
+
+
+def title_font():
+    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, 'Georgia')
 
 
 def windows_language():
@@ -99,21 +118,22 @@ def windows_language():
         primary = ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3ff
     except (AttributeError, OSError):
         primary = 0
-    return 'pt' if primary == 0x16 else 'en'
+    return {0x16: 'pt', 0x0a: 'es', 0x04: 'zh', 0x12: 'ko', 0x19: 'ru'}.get(primary, 'en')
 
 
 # ---------------------------------------------------------------------------------------------
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'fps60': False, 'fps_unlocked': False, 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'hq_textures': True, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': '', 'check_updates': True, 'skip_version': ''}
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'library_dirs': [], 'keys': {},
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off',
+                'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
     ('move_up', 'W', ('Andar para frente', 'Move forward')), ('move_down', 'S', ('Andar para trás', 'Move back')),
@@ -142,6 +162,14 @@ TK_TO_SDL = {
 GPU_SUBMIT = [('auto', ('Automático (ligado em NVIDIA)', 'Automatic (on with NVIDIA)')),
               ('on', ('Ligado em qualquer placa (AMD/Intel: experimental)', 'On with any card (AMD/Intel: experimental)')),
               ('off', ('Desligado', 'Off'))]
+# Video memory use (#143): (texture collection from % of the card's budget, arena release from MB; 0 = never).
+VRAM_USE = [('low', ('Econômico (placas de 4–6 GB)', 'Economy (4–6 GB cards)')),
+            ('normal', ('Padrão', 'Default')),
+            ('high', ('Alto (placas de 8–12 GB)', 'High (8–12 GB cards)')),
+            ('max', ('Máximo (placas de 16 GB ou mais)', 'Maximum (16 GB cards or more)'))]
+VOLUME = [('100', ('100% (original)', '100% (original)')), ('150', ('150%', '150%')),
+          ('200', ('200%', '200%')), ('300', ('300% (máximo)', '300% (maximum)'))]
+VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '4096'), 'max': ('85', '0')}
 
 
 def sdl_key_name(keysym):
@@ -186,6 +214,20 @@ OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)')
     (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
+# Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
+# (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
+BUTTON_ICONS = [('ps', ('PlayStation (do jogo)', 'PlayStation (the game\'s)')),
+                ('xbox', ('Xbox (A B X Y)', 'Xbox (A B X Y)'))]
+# Frame rate: 30 (the game's cap, as on PS4), 60 (the cap off, at most one frame per two 120 Hz
+# vblanks: SOTC_FPS_LIMIT=60) or unlimited.
+FPS_MODES = [('30', ('30 FPS (como no PS4)', '30 FPS (as on PS4)')),
+             ('60', ('60 FPS (sem o limite do jogo)', '60 FPS (game cap off)')),
+             ('unlimited', ('Ilimitado (acima de 60)', 'Unlimited (above 60)'))]
+# Frame generation (bb-probe: SOTC_FRAMEGEN; F8 in game switches off / DLSS-G / FSR 3).
+FRAMEGEN = [('off', ('Desligada', 'Off')),
+            ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
+            ('dlss', ('NVIDIA DLSS-G (RTX 40/50)', 'NVIDIA DLSS-G (RTX 40/50)')),
+            ('fsr', ('AMD FSR 3 (qualquer placa)', 'AMD FSR 3 (any GPU)'))]
 SHARPNESS = [('0', ('Alta', 'High')), ('250', ('Média (padrão)', 'Medium (default)')), ('600', ('Baixa', 'Low')),
              ('off', ('Desligada', 'Off'))]
 MOUSE_SENS = [('0.5', ('0,5 (lenta)', '0.5 (slow)')), ('0.75', ('0,75', '0.75')), ('1.0', ('1,0 (padrão)', '1.0 (default)')),
@@ -200,7 +242,9 @@ LANGUAGES = [('', ('Automático (o do jogo)', 'Automatic (the game\'s)')),
              ('4', ('Alemão', 'German')), ('5', ('Italiano', 'Italian')), ('0', ('Japonês', 'Japanese'))]
 READBACKS = [('', ('Precisas (padrão; o jogo precisa)', 'Precise (default; the game needs them)')),
              ('1', ('Relaxadas (pode travar)', 'Relaxed (may hang)'))]
-UI_LANGUAGES = [('', ('Automático', 'Automatic')), ('pt', ('Português', 'Portuguese')), ('en', ('Inglês', 'English'))]
+UI_LANGUAGES = [('', ('Automático', 'Automatic')), ('pt', ('Português', 'Português')), ('en', ('English', 'English')),
+                ('es', ('Español', 'Español')), ('zh', ('简体中文', '简体中文')), ('ko', ('한국어', '한국어')),
+                ('ru', ('Русский', 'Русский'))]
 CONTROLS = [('W A S D', ('analógico esquerdo', 'left stick')), (('setas', 'arrows'), ('analógico direito (câmera)', 'right stick (camera)')),
             ('Espaço / Space', '✕'), ('Shift', '○'), ('E', '□'), ('Q', '△'), ('1 / 3', 'L1 / R1'), ('R / F', 'L2 / R2'),
             ('Z / C', 'L3 / R3'), ('Enter', 'Options'), ('I J K L', ('direcional', 'd-pad')),
@@ -305,19 +349,74 @@ def short_path(path):
         return str(path)
 
 
+def load_settings():
+    """Saved settings over the defaults. Older settings that turned DLSS-G on with SOTC_DLSSG=1 in
+    the extra variables get the frame generation setting instead."""
+    saved = load_json(CONFIG_FILE, {})
+    settings = {**APP_DEFAULTS, **saved}
+    if 'fps_mode' not in saved:  # before the choice: the "uncapped FPS" box
+        # sotc: the fork's 0.57-opt8 "Unlocked FPS" box maps to the unlimited mode.
+        settings['fps_mode'] = ('unlimited' if saved.get('fps_unlocked') else
+                                '60' if saved.get('fps60') else '30')
+    if 'framegen' not in saved:
+        extra = str(settings.get('extra_env', '')).split()
+        if 'SOTC_DLSSG=1' in extra:
+            settings['framegen'] = 'auto'
+            settings['extra_env'] = ' '.join(item for item in extra if item != 'SOTC_DLSSG=1')
+    return settings
+
+
+def window_icon_file(s):
+    """The game window's icon as a 64x64 BMP in the data folder (bb-probe: SOTC_WINDOW_ICON):
+    empty setting = the port's own (launcher/window_icon.png, original art: the swordsman), 'game'
+    = icon0.png of the player's dump, else a picture the player chose (cropped to a centred
+    square). Nothing of the game or of anyone's art is packaged."""
+    try:
+        from PIL import Image
+        choice = s.get('window_icon_file') or ''
+        custom = Path(choice) if choice not in ('', 'game') else Path('')
+        if choice == 'game':
+            source, target = Path(s['game_dir'] or '.') / 'sce_sys' / 'icon0.png', user_dir(s) / 'game_icon.bmp'
+        elif choice and custom.is_file():
+            source, target = custom, user_dir(s) / 'window_icon_custom.bmp'
+        else:
+            source, target = PORT_DIR / 'launcher' / 'window_icon.png', user_dir(s) / 'window_icon_port.bmp'
+        if (not target.is_file() or target.stat().st_mtime < source.stat().st_mtime
+                or source == custom):
+            with Image.open(source) as image:
+                image = image.convert('RGBA')
+                side = min(image.size)
+                left, top = (image.width - side) // 2, (image.height - side) // 2
+                if source == custom:
+                    image = image.crop((left, top, left + side, top + side))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                image.resize((64, 64), Image.LANCZOS).save(target)
+        return target
+    except (ImportError, OSError, ValueError):
+        return None
+
+
 def game_environment(s):
     env = dict(os.environ)
+    info = game_info(s['game_dir'])
+    if info and info[1] != '?':
+        env['SOTC_GAME_VERSION'] = info[1]  # window title (with the frame rate)
+    icon = window_icon_file(s)
+    if icon:
+        env['SOTC_WINDOW_ICON'] = str(icon)
     env['SOTC_GAME_DIR'] = s['game_dir']
     env['SOTC_USER_DIR'] = str(user_dir(s))
     if s['sys_modules']:
         env['SOTC_SYS_MODULES'] = s['sys_modules']
     if s.get('dlc_dir'):
         env['SOTC_DLC_DIR'] = s['dlc_dir']
-    fps60 = s.get('fps60') or s.get('fps_unlocked')
-    env['SOTC_MODES'] = ','.join(m for m, on in (('af16', s.get('af16')), ('fps60', fps60)) if on)
-    if fps60:
-        # sotc.py caps the 60 FPS mode at 60; unlocked runs up to the 120 Hz vblank.
-        env['SOTC_FPS_CAP'] = '0' if s.get('fps_unlocked') else '60'
+    env['SOTC_MODES'] = 'af16' if s.get('af16') else ''
+    # The 30 FPS cap is applied or not by bb-probe (sotc_fps_cap.h), F7 switches it in game: no
+    # fps60 code patch, vblanks at 120 Hz in every mode; 60 FPS limits the uncapped game.
+    fps_mode = s.get('fps_mode') or '30'
+    env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
+    env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
+    env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     env['BB_PRESENT_MODE'] = s['present_mode']
     if s['language']:
@@ -343,13 +442,27 @@ def game_environment(s):
         env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
-    env['SOTC_NEO'] = '1' if s.get('neo') else '0'
+    env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS.get(s.get('vram_use'), VRAM_LIMITS['normal'])
+    env['SOTC_VOLUME'] = str(s.get('volume') or '100')
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
+    # The PS4 Pro path keeps its 16:9 sizes: a wider screen (21:9, 32:9) wins over it (#142).
+    env['SOTC_NEO'] = '1' if s.get('neo') and not is_wide(env['SOTC_OUTPUT_RES']) else '0'
+    if s.get('neo') and env['SOTC_NEO'] == '0':
+        env['SOTC_NOTE'] = f"{env['SOTC_OUTPUT_RES']} is wider than 16:9: PS4 Pro mode off (it renders 16:9 only)"
+    env['SOTC_FRAMEGEN'] = s.get('framegen') or 'off'
+    # sotc: high quality textures: the texture banks sampled since the last report read as sampled
+    # (sotc_lod_stats.h; before, none ever did and the game never streamed its fine mips: blurry
+    # leaves and rocks). Off: the old behaviour, for cards short of video memory.
+    if s.get('hq_textures', True):
+        env.setdefault('SOTC_LOD_LINGER', '1')
+    if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
+        env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
+    env['SOTC_UI_LANG'] = s.get('ui_language') or windows_language()  # overlay and F7/F8 texts
     # The game renders at the output size (sotc.py scales it down above about 4.2 million pixels; the
     # upscaler takes it to the output). 720p renders at 1080p, as on PS4; the PS4 Pro path keeps its
     # own sizes.
     output = env['SOTC_OUTPUT_RES']
-    if output not in ('1280x720', '1920x1080') and not s.get('neo'):
+    if output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = output
     env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
     if s.get('sharpness') == 'off':
@@ -370,6 +483,15 @@ def game_environment(s):
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8'
     return env
+
+
+def is_wide(size):
+    """True for a WxH wider than 16:9 (by more than 2%)."""
+    try:
+        w, h = map(int, str(size).split('x'))
+    except ValueError:
+        return False
+    return w * 9 > h * 16 * 1.02
 
 
 def shadps4_saves():
@@ -397,7 +519,7 @@ class Launcher:
     def __init__(self, root, tk, ttk, filedialog, messagebox):
         self.tk, self.ttk, self.filedialog, self.messagebox = tk, ttk, filedialog, messagebox
         self.root = root
-        self.app = {**APP_DEFAULTS, **load_json(CONFIG_FILE, {})}
+        self.app = load_settings()
         self.vars = {}
         self.process = self.job = None
         self.stopping = False
@@ -405,7 +527,7 @@ class Launcher:
         self.ui_calls = queue.Queue()
         self.gpu_text = _('• Verificando a placa de vídeo…', '• Checking the graphics card…')
         self.banner_source = self.banner_image = None
-        root.title('Shadow of the Colossus — port nativo' if LANG == 'pt' else 'Shadow of the Colossus — native port')
+        root.title('Shadow of the Colossus — ' + _('port nativo', 'native port'))
         root.configure(bg=BG)
         self.dpi = root.winfo_fpixels('1i') / 96.0
         root.geometry(f'{self.px(1080)}x{self.px(700)}')
@@ -494,7 +616,7 @@ class Launcher:
             ('Sotc.indicator', {'side': 'left', 'sticky': ''}),
             ('Checkbutton.focus', {'side': 'left', 'sticky': 'w', 'children': [
                 ('Checkbutton.label', {'sticky': 'nswe'})]})]})])
-        base = ('Segoe UI', 10)
+        base = (ui_font(), 10)
         self.root.option_add('*TCombobox*Listbox.background', CARD)
         self.root.option_add('*TCombobox*Listbox.foreground', TEXT)
         self.root.option_add('*TCombobox*Listbox.selectBackground', ACCENT)
@@ -503,8 +625,8 @@ class Launcher:
                     lightcolor=LINE, darkcolor=LINE, troughcolor=CARD, focuscolor=GOLD, font=base)
         s.configure('TFrame', background=PANEL)
         s.configure('TLabel', background=PANEL, foreground=TEXT)
-        s.configure('Muted.TLabel', background=PANEL, foreground=MUTED, font=('Segoe UI', 9))
-        s.configure('Section.TLabel', background=PANEL, foreground=GOLD, font=('Georgia', 13))
+        s.configure('Muted.TLabel', background=PANEL, foreground=MUTED, font=(ui_font(), 9))
+        s.configure('Section.TLabel', background=PANEL, foreground=GOLD, font=(title_font(), 13))
         s.configure('TCheckbutton', background=PANEL, foreground=TEXT, padding=(0, 3), indicatorbackground=CARD,
                     indicatorforeground=GOLD)
         s.map('TCheckbutton', background=[('active', PANEL)], indicatorbackground=[('selected', ACCENT)])
@@ -515,7 +637,7 @@ class Launcher:
         s.configure('TEntry', foreground=TEXT, insertcolor=TEXT, padding=4)
         s.configure('TButton', background=CARD, foreground=TEXT, padding=(12, 6), borderwidth=1)
         s.map('TButton', background=[('active', LINE), ('disabled', PANEL)], foreground=[('disabled', MUTED)])
-        s.configure('Play.TButton', background=ACCENT, foreground='#f4f1ea', font=('Georgia', 15, 'bold'),
+        s.configure('Play.TButton', background=ACCENT, foreground='#f4f1ea', font=(title_font(), 15, 'bold'),
                     padding=(36, 10), borderwidth=0)
         s.map('Play.TButton', background=[('active', ACCENT_HI), ('disabled', '#263038')],
               foreground=[('disabled', '#7d858c')])
@@ -574,6 +696,30 @@ class Launcher:
         self.ttk.Label(parent, text=title, style='Section.TLabel').grid(
             row=self.next_row(parent), column=0, columnspan=2, sticky='w', pady=(top, 2))
 
+    def window_icon_row(self, parent):
+        """The game window's icon: the game's (empty) or a picture of the player's choice."""
+        ttk = self.ttk
+        var = self.var('window_icon_file')
+        holder = ttk.Frame(parent)
+        ttk.Entry(holder, textvariable=var, width=40).pack(side='left')
+
+        def browse():
+            chosen = self.filedialog.askopenfilename(
+                title=_('Imagem para o ícone da janela do jogo', "Picture for the game window's icon"),
+                filetypes=[(_('Imagens', 'Pictures'), '*.png *.jpg *.jpeg *.bmp *.webp'), ('*', '*.*')])
+            if chosen:
+                var.set(str(Path(chosen)))
+        ttk.Button(holder, text=_('Escolher imagem…', 'Choose picture…'), command=browse).pack(side='left', padx=(6, 0))
+        ttk.Button(holder, text=_('Usar o do jogo', "Use the game's"), command=lambda: var.set('game')).pack(side='left', padx=(6, 0))
+        ttk.Button(holder, text=_('Padrão', 'Default'), command=lambda: var.set('')).pack(side='left', padx=(6, 0))
+        return self.row(parent, _('Ícone da janela do jogo', "Game window's icon"), holder,
+                        _('Padrão: o desenho do port (o menino erguendo a espada). "game": o ícone do próprio jogo. '
+                          'Ou escolha uma imagem sua (PNG/JPG): ela é recortada em quadrado no centro. Vale na '
+                          'próxima vez que o jogo abrir.',
+                          'Default: the port\'s drawing (the boy raising his sword). "game": the game\'s own icon. '
+                          'Or choose a picture of yours (PNG/JPG): it is cropped to a centred square. Applies the '
+                          'next time the game starts.'))
+
     def folder(self, parent, key, title, prompt, hint=None, on_change=None):
         ttk = self.ttk
         var = self.var(key)
@@ -596,7 +742,7 @@ class Launcher:
         outer = ttk.Frame(self.content)
         head = ttk.Frame(outer, padding=(28, 22, 28, 6))
         head.pack(fill='x')
-        ttk.Label(head, text=title, background=PANEL, foreground=TEXT, font=('Georgia', 20)).pack(anchor='w')
+        ttk.Label(head, text=title, background=PANEL, foreground=TEXT, font=(title_font(), 20)).pack(anchor='w')
         ttk.Label(head, text=subtitle, style='Muted.TLabel').pack(anchor='w')
         canvas = tk.Canvas(outer, bg=PANEL, highlightthickness=0, bd=0)
         bar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
@@ -618,15 +764,15 @@ class Launcher:
         side = tk.Frame(self.root, bg=BG, width=self.px(220))
         side.pack(side='left', fill='y')
         side.pack_propagate(False)
-        tk.Label(side, text='SHADOW OF\nTHE COLOSSUS', bg=BG, fg=GOLD, font=('Georgia', 15), justify='left').pack(
+        tk.Label(side, text='SHADOW OF\nTHE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 15), justify='left').pack(
             anchor='w', padx=22, pady=(24, 0))
         tk.Label(side, text=_('port nativo · Windows', 'native port · Windows') + f'  ·  v{VERSION}', bg=BG, fg=MUTED,
-                 font=('Segoe UI', 9)).pack(anchor='w', padx=22, pady=(2, 20))
+                 font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(2, 20))
         self.nav, self.current_page = {}, None
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo e saves', 'Game & saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
                             ('advanced', _('Avançado', 'Advanced'))):
-            item = tk.Label(side, text='    ' + title, bg=BG, fg=TEXT, anchor='w', font=('Segoe UI', 11),
+            item = tk.Label(side, text='    ' + title, bg=BG, fg=TEXT, anchor='w', font=(ui_font(), 11),
                             pady=10, cursor='hand2')
             item.pack(fill='x')
             item.bind('<Button-1>', lambda _e, n=name: self.show(n))
@@ -637,7 +783,7 @@ class Launcher:
         for text, command in ((_('Registro do jogo', 'Game log'), lambda: self.show('log')),
                               (_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True)),
                               (_('Configurar de novo', 'Set up again'), self.show_setup)):
-            link = tk.Label(side, text=text, bg=BG, fg=MUTED, font=('Segoe UI', 9, 'underline'), cursor='hand2')
+            link = tk.Label(side, text=text, bg=BG, fg=MUTED, font=(ui_font(), 9, 'underline'), cursor='hand2')
             link.pack(anchor='w', padx=22, pady=(0, 6))
             link.bind('<Button-1>', lambda _e, c=command: c())
         tk.Frame(side, bg=BG, height=12).pack()
@@ -647,7 +793,7 @@ class Launcher:
         bar = tk.Frame(right, bg=BG, height=72)
         bar.pack(fill='x', side='bottom')
         bar.pack_propagate(False)
-        self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=('Segoe UI', 10), anchor='w', justify='left')
+        self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), anchor='w', justify='left')
         self.status.pack(side='left', padx=24)
         self.play_button = ttk.Button(bar, text=_('JOGAR', 'PLAY'), style='Play.TButton', command=self.play)
         self.play_button.pack(side='right', padx=(10, 24), pady=11)
@@ -706,16 +852,15 @@ class Launcher:
             row=0, column=0, columnspan=2, sticky='w', pady=(0, 2))
         self.row(quick, _('Saída', 'Output'), self.choice(quick, 'output_res', OUTPUTS, 24))
         self.row(quick, _('Upscaler', 'Upscaler'), self.choice(quick, 'upscaler', UPSCALERS, 24))
-        self.check(quick, 'fps60', _('60 FPS (experimental)', '60 FPS (experimental)'))
-        self.check(quick, 'fps_unlocked', _('FPS livre (experimental)', 'Unlocked FPS (experimental)'))
+        self.row(quick, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(quick, 'sharpness', SHARPNESS, 24))
+        self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
+        self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
+        self.check(quick, 'hq_textures', _('Texturas em alta qualidade', 'High quality textures'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
-        for key in ('af16', 'fps60', 'fps_unlocked', 'fullscreen', 'output_res', 'upscaler'):
+        self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
+        for key in ('af16', 'hq_textures', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
-        # 60 FPS and unlocked FPS are two variants of the same mode: checking one clears the other.
-        for key, other in (('fps60', 'fps_unlocked'), ('fps_unlocked', 'fps60')):
-            self.vars[key].trace_add('write', lambda *_a, k=key, o=other:
-                                     self.vars[k].get() and self.vars[o].get() and self.vars[o].set(False))
 
     def draw_banner(self):
         """The dump's own art (sce_sys/pic1.png) under the title."""
@@ -737,14 +882,14 @@ class Launcher:
                 c.create_rectangle(0, h - 120 + i * 24, w, h - 96 + i * 24, fill=PANEL, outline='', stipple=stipple)
             c.create_rectangle(0, h - 24, w, h, fill=PANEL, outline='')
         else:
-            c.create_text(30, h - 80, text='Shadow of the Colossus', anchor='w', fill='#f2ead9', font=('Georgia', 32))
+            c.create_text(30, h - 80, text='Shadow of the Colossus', anchor='w', fill='#f2ead9', font=(title_font(), 32))
             c.create_text(w // 2, h // 2 - 40, text=_('Escolha a pasta do jogo (Jogo e saves)',
                                                        'Choose your game folder (Game & saves)'),
-                          fill=MUTED, font=('Segoe UI', 11))
+                          fill=MUTED, font=(ui_font(), 11))
         info = game_info(self.var('game_dir').get())
         sub = (_('{} · versão do jogo {}', '{} · game version {}').format(*info) if info
                else _('Pasta do jogo não escolhida', 'Game folder not set'))
-        c.create_text(33, h - 30, text=sub, anchor='w', fill=GOLD, font=('Segoe UI', 11))
+        c.create_text(33, h - 30, text=sub, anchor='w', fill=GOLD, font=(ui_font(), 11))
 
     def scaled_art(self, path, width):
         try:
@@ -807,6 +952,11 @@ class Launcher:
                       'a shadPS4 installed on this PC (user/sys_modules) and copies them to the port\'s data folder. '
                       'They are Sony firmware and never come with the port. Without them the game is silent.'),
                     on_change=self.refresh_status)
+        self.row(f, _('Volume', 'Volume'), self.choice(f, 'volume', VOLUME),
+                 _('Aumenta o som do jogo, que sai baixo. Acima de 100% os picos são suavizados em vez de '
+                   'estourar. No jogo, o modo de alto-falante "TV" também deixa o som mais alto.',
+                   'Raises the game sound, which is quiet. Above 100% the peaks are softened instead of '
+                   'clipping. In game, the "TV" speaker mode is louder too.'))
         self.section(f, _('DLC', 'DLC'))
         self.folder(f, 'dlc_dir', _('Pasta de DLC', 'DLC folder'), _('Pasta com as DLCs do jogo', "Folder with the game's DLC"),
                     _('Como no shadPS4: uma pasta com uma subpasta por DLC (cada uma com sce_sys/param.sfo), ou a '
@@ -837,14 +987,29 @@ class Launcher:
         self.check(f, 'af16', _('Texturas nítidas (filtro anisotrópico 16x)', 'Sharp textures (16x anisotropic filtering)'),
                    _('Chão, grama e rochas ficam nítidos à distância, quase sem custo.',
                      'Ground, grass and rocks stay sharp at a distance, at almost no cost.'))
-        self.check(f, 'fps60', _('60 FPS (experimental)', '60 FPS (experimental)'),
-                   _('Tira o limite de 30 FPS do jogo e limita a 60 FPS, como no PS4 Pro.',
-                     'Removes the game\'s 30 FPS cap and limits it to 60 FPS, as on PS4 Pro.'))
-        self.check(f, 'fps_unlocked', _('FPS livre (experimental)', 'Unlocked FPS (experimental)'),
-                   _('Sem limite (até 120 FPS). O jogo nunca rodou acima de 60: pode quebrar algumas lutas '
-                     '(o 5º colosso que sai voando, a cena do 2º colosso que não começa).',
-                     'No limit (up to 120 FPS). The game never ran above 60: it can break some fights '
-                     '(the 5th colossus flying away, the 2nd colossus cutscene that never starts).'))
+        self.row(f, _('FPS', 'FPS'), self.choice(f, 'fps_mode', FPS_MODES),
+                 _('30: o limite do próprio jogo, como no PS4 (a física é feita para ele). 60: sem o limite do '
+                   'jogo, no máximo 60 (40 a 60 conforme a região, num processador rápido). Ilimitado: acima de '
+                   '60 em telas rápidas. Sem o limite, algumas cenas podem se comportar diferente. No jogo, F7 '
+                   'liga e desliga o limite de 30 a qualquer momento.',
+                   '30: the game\'s own cap, as on PS4 (its physics are made for it). 60: the game\'s cap off, at '
+                   'most 60 (40 to 60 depending on the area, with a fast CPU). Unlimited: above 60 on fast '
+                   'screens. Without the cap some scenes may behave differently. In game, F7 turns the 30 FPS '
+                   'cap on and off at any time.'))
+        self.row(f, _('Geração de quadros', 'Frame generation'), self.choice(f, 'framegen', FRAMEGEN),
+                 _('Uma imagem gerada entre duas do jogo: com 30 FPS (limite ligado) a tela mostra 60. DLSS-G: '
+                   'NVIDIA RTX 40/50. FSR 3: qualquer placa (RTX 20/30, AMD, Intel). Automática: DLSS-G se a '
+                   'placa tiver, senão FSR 3. Experimental: só faz diferença com o modo 60 FPS desligado, e a '
+                   'barra de vida e de stamina pode tremer (a imagem gerada inclui a interface). '
+                   'No jogo, F8 troca o modo (desligada, DLSS-G, FSR 3). Melhor com '
+                   'a tela a 60 ou 120 Hz, ou G-SYNC/FreeSync.',
+                   'One generated frame between two game frames: at 30 FPS (capped) the screen shows '
+                   '60. DLSS-G: NVIDIA RTX 40/50. FSR 3: any GPU (RTX 20/30, AMD, Intel). Automatic: DLSS-G when '
+                   'the GPU has it, else FSR 3. Experimental: it only matters with the 60 FPS mode off, and the '
+                   'health and stamina bars may shake (the generated frame includes the interface). '
+                   'In game, F8 switches the mode (off, DLSS-G, FSR 3). Best with the '
+                   'screen at 60 or 120 Hz, or G-SYNC/FreeSync.'))
+        self.window_icon_row(f)
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
                  _('O jogo renderiza nesse tamanho; acima de cerca de 4,2 milhões de pixels (4K, 3440 × 1440) num '
@@ -896,6 +1061,13 @@ class Launcher:
                    'Sends work to the GPU every 0.5 ms and reads results through a shortcut (Pink-shadPS4 '
                    'techniques). Measured on NVIDIA (+10–15%); on AMD/Intel pick "On" to try it and go back to '
                    '"Automatic" if the screen turns black.'))
+        self.row(f, _('Uso de memória de vídeo', 'Video memory use'), self.choice(f, 'vram_use', VRAM_USE),
+                 _('Até onde o jogo enche a memória da placa antes de liberar texturas e buffers. Padrão: '
+                   'libera a partir de 60%. Em placas de 8 GB ou mais, "Alto" ou "Máximo" evita recarregar '
+                   'texturas (menos engasgos). Se aparecer erro de falta de memória, volte um nível.',
+                   'How far the game fills the card memory before it frees textures and buffers. Default: '
+                   'frees from 60%. On 8 GB cards or more, "High" or "Maximum" avoids reloading textures '
+                   '(less stutter). On an out-of-memory error, go back one level.'))
         self.section(f, _('Efeitos', 'Effects'))
         for key, title, _off in EFFECTS:
             self.check(f, key, _(*title))
@@ -911,6 +1083,11 @@ class Launcher:
                                _('Um controle (DualShock 4, DualSense, Xbox…) é usado automaticamente.',
                                  'A gamepad (DualShock 4, DualSense, Xbox…) is used automatically.'))
         self.section(f, _('Controle', 'Gamepad'), top=4)
+        self.row(f, _('Ícones dos botões', 'Button icons'), self.choice(f, 'button_icons', BUTTON_ICONS),
+                 _('Os ícones que o jogo mostra nas dicas: os do PlayStation ou os do Xbox (A B X Y, LB/RB, '
+                   'LT/RT, Menu, View), desenhados para o port. Vale na próxima vez que o jogo abrir.',
+                   'The icons the game shows in its prompts: PlayStation ones or Xbox ones (A B X Y, LB/RB, '
+                   'LT/RT, Menu, View), drawn for the port. Applies the next time the game starts.'))
         self.row(f, _('Controle preferido', 'Preferred gamepad'), ttk.Entry(f, textvariable=self.var('gamepad'), width=30),
                  _('Nome (ou parte) do controle a usar quando houver vários; vazio = o primeiro.',
                    'Name (or part of it) of the gamepad to use when several are connected; empty = the first.'))
@@ -963,7 +1140,7 @@ class Launcher:
         window.resizable(False, False)
         label = next(_(*l) for n, _d, l in KEY_INPUTS if n == name)
         ttk.Label(window, text=_('Aperte a tecla para: {}', 'Press the key for: {}').format(label),
-                  font=('Segoe UI', 12)).pack(padx=30, pady=(24, 6))
+                  font=(ui_font(), 12)).pack(padx=30, pady=(24, 6))
         hint = ttk.Label(window, text=_('Esc cancela', 'Esc cancels'), style='Muted.TLabel')
         hint.pack(padx=30, pady=(0, 22))
 
@@ -1023,7 +1200,7 @@ class Launcher:
         self.pages['log'] = page
         top = ttk.Frame(page)
         top.pack(fill='x', pady=(0, 8))
-        ttk.Label(top, text=_('Registro', 'Log'), font=('Georgia', 20)).pack(side='left')
+        ttk.Label(top, text=_('Registro', 'Log'), font=(title_font(), 20)).pack(side='left')
         ttk.Button(top, text=_('Copiar', 'Copy'), command=self.copy_log).pack(side='right')
         ttk.Button(top, text=_('Limpar', 'Clear'), command=lambda: self.set_log('')).pack(side='right', padx=6)
         self.log = tk.Text(page, wrap='none', bg='#090a0b', fg='#c9ccd0', insertbackground=TEXT, relief='flat',
@@ -1078,14 +1255,18 @@ class Launcher:
                                                                      'Choose the game folder first.'), fg=MUTED)
 
     def summary(self):
-        parts = [_('FPS livre', 'unlocked FPS') if self.var('fps_unlocked').get() else
-                 _('60 FPS', '60 FPS') if self.var('fps60').get() else _('30 FPS (como no PS4)', '30 FPS (as on PS4)'),
+        parts = [dict((k, _(*v)) for k, v in FPS_MODES).get(self.var('fps_mode').get(), '30 FPS'),
                  self.var('output_res').get().replace('x', ' × '),
                  'FSR 1' if self.var('upscaler').get() == 'fsr1' else 'bilinear']
+        framegen = self.var('framegen').get()
+        if framegen != 'off':
+            parts.append({'auto': _('geração de quadros', 'frame generation'), 'dlss': 'DLSS-G',
+                          'fsr': 'FSR 3'}.get(framegen, framegen))
         if self.var('af16').get():
             parts.append(_('AF 16x', '16x AF'))
         if self.var('neo').get():
-            parts.append('PS4 Pro')
+            parts.append('PS4 Pro' if not is_wide(self.var('output_res').get())
+                         else _('PS4 Pro desligado (tela larga)', 'PS4 Pro off (wide screen)'))
         parts.append(_('tela cheia', 'fullscreen') if self.var('fullscreen').get() else _('janela', 'window'))
         return '   ·   '.join(parts)
 
@@ -1111,6 +1292,15 @@ class Launcher:
             pass
         self.gpu_text = text
         self.ui_calls.put(self.refresh_status)
+
+    def restart(self):
+        """Opens the launcher again (after a language change) and closes this one."""
+        command = [sys.executable] if FROZEN else [sys.executable, str(Path(__file__).resolve())]
+        try:
+            subprocess.Popen(command + [a for a in sys.argv[1:] if a != '--play'], cwd=str(PORT_DIR))
+        except OSError:
+            return
+        self.root.destroy()
 
     def collect(self):
         for key, var in self.vars.items():
@@ -1160,12 +1350,30 @@ class Launcher:
         frame = self.setup_frame = tk.Frame(self.root, bg=BG)
         frame.place(relx=0, rely=0, relwidth=1, relheight=1)
         frame.lift()
+        # The launcher's language, first thing (names in their own language); the launcher opens
+        # again in it.
+        lang_box = tk.Frame(frame, bg=BG)
+        lang_box.place(relx=1.0, rely=0.0, anchor='ne', x=-self.px(20), y=self.px(16))
+        tk.Label(lang_box, text='🌐', bg=BG, fg=MUTED, font=(ui_font(), 13)).pack(side='left', padx=(0, 6))
+        names = [(code, labels[0]) for code, labels in UI_LANGUAGES if code]
+        lang_var = tk.StringVar(value=dict(names).get(LANG, 'English'))
+        lang_combo = ttk.Combobox(lang_box, textvariable=lang_var, values=[name for _c, name in names],
+                                  state='readonly', width=14, font=(ui_font(), 11))
+        lang_combo.pack(side='left')
+
+        def language_chosen(_event=None):
+            code = next((c for c, name in names if name == lang_var.get()), '')
+            if code and code != LANG:
+                self.var('ui_language').set(code)
+                self.collect()
+                self.restart()
+        lang_combo.bind('<<ComboboxSelected>>', language_chosen)
         inner = tk.Frame(frame, bg=BG)
         inner.place(relx=0.5, rely=0.45, anchor='center')
-        tk.Label(inner, text='SHADOW OF THE COLOSSUS', bg=BG, fg=GOLD, font=('Georgia', 26)).pack()
+        tk.Label(inner, text='SHADOW OF THE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 26)).pack()
         tk.Label(inner, text=_('Bem-vindo. Só falta dizer onde está o jogo.',
                                'Welcome. Just tell us where the game is.'),
-                 bg=BG, fg=TEXT, font=('Segoe UI', 13)).pack(pady=(8, 26))
+                 bg=BG, fg=TEXT, font=(ui_font(), 13)).pack(pady=(8, 26))
         self.setup_button = ttk.Button(inner, text=_('Escolher a pasta do jogo…', 'Choose the game folder…'),
                                        style='Play.TButton', command=self.choose_game_for_setup)
         self.setup_button.pack(ipadx=18)
@@ -1173,8 +1381,8 @@ class Launcher:
                                'atualização (-UPDATE/-patch) e das DLCs são encontradas sozinhas.',
                                "The game's main folder, as in shadPS4: the game (CUSA08809), update (-UPDATE/-patch) "
                                'and DLC subfolders are found on their own.'),
-                 bg=BG, fg=MUTED, font=('Segoe UI', 10), wraplength=self.px(560), justify='center').pack(pady=(10, 0))
-        self.setup_hint = tk.Label(inner, text='', bg=BG, fg=MUTED, font=('Segoe UI', 10), cursor='hand2',
+                 bg=BG, fg=MUTED, font=(ui_font(), 10), wraplength=self.px(560), justify='center').pack(pady=(10, 0))
+        self.setup_hint = tk.Label(inner, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), cursor='hand2',
                                    wraplength=self.px(640), justify='center')
         self.setup_hint.pack(pady=(18, 0))
         self.setup_results = tk.Frame(inner, bg=BG)
@@ -1300,8 +1508,8 @@ class Launcher:
             color = GOLD if mark == '✓' else '#d9b441' if mark == '⚠' else MUTED
             row = tk.Frame(self.setup_results, bg=BG)
             row.pack(anchor='w', pady=2)
-            tk.Label(row, text=mark, bg=BG, fg=color, font=('Segoe UI', 12), width=2).pack(side='left')
-            tk.Label(row, text=text, bg=BG, fg=TEXT, font=('Segoe UI', 11)).pack(side='left')
+            tk.Label(row, text=mark, bg=BG, fg=color, font=(ui_font(), 12), width=2).pack(side='left')
+            tk.Label(row, text=text, bg=BG, fg=TEXT, font=(ui_font(), 11)).pack(side='left')
         buttons = tk.Frame(self.setup_results, bg=BG)
         buttons.pack(pady=(20, 0))
         if not result['sound']:
@@ -1779,7 +1987,7 @@ def main():
         if FROZEN:
             sotc_update.start_applier(new_root, PORT_DIR)
         sys.exit(0)
-    settings = {**APP_DEFAULTS, **load_json(CONFIG_FILE, {})}
+    settings = load_settings()
     LANG = settings.get('ui_language') or windows_language()
     if '--play' in args and (Path(settings['game_dir'] or '.') / 'eboot.bin').is_file():
         sys.exit(play_without_window(settings))

@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.59 — 2026-10-20
+Obrigado a **Oussama268, Lucas-blip-png e EdouardSence**.
+
+**Desempenho**
+- **Mais FPS e menos travadas** (fork do Oussama268, opt5–opt7): os desenhos são preparados numa
+  thread própria (#99 Lucas-blip-png), a memória direta é enviada aos poucos e os shaders e
+  pipelines de compute são traduzidos em threads auxiliares (o objeto espera alguns quadros em vez
+  de a tela travar). Demo da tela de título: média 63 → 65–67 FPS, mínima 30 → 34–37, ponte
+  30–32 → 37–40.
+
+**Estabilidade**
+- **Queda no final do jogo e ao carregar saves** (`0x1a371` / `0x49500`): a GPU às vezes devolvia
+  dados velhos para memória que o jogo já tinha liberado, corrompendo o alocador. A proteção do
+  Pink-shadPS4 cuidava de um só dos reservatórios de memória do jogo; agora cobre todos os do
+  mesmo tipo, inclusive os criados quando o mundo carrega (área do último colosso). O jogo também
+  recebe 9152 MB de memória direta em todos os modos (#146, #149). Causa achada com logs de
+  quedas reais; a passagem completa até os créditos ainda está em teste.
+- **Placas de 6 GB** fechando por falta de memória de vídeo: tenta o tamanho exato e a RAM do PC
+  antes de desistir (#137).
+- **Lançador em Windows chinês** quebrava com o "™" do título (#151).
+
+**Novidades**
+- **F11** alterna janela / tela cheia (#118, EdouardSence).
+- **Uso de memória de vídeo:** Econômico, Padrão, Alto e Máximo (antes o jogo limpava texturas a
+  partir de 60% da placa, o "limite de 6 GB" das placas de 8–16 GB) (#143).
+- **Volume:** 100 a 300%, sem estourar (#95).
+- **Atualização automática:** o lançador avisa quando sai versão nova e instala sozinho, mantendo
+  saves, cache de shaders e sotc.ini (#136, Oussama268). Vale a partir desta versão.
+- **Ultrawide com o modo PS4 Pro:** 21:9 e 32:9 ficavam com bordas pretas com o modo Pro ligado;
+  agora a tela larga tem prioridade (#142, #145).
+
+## 0.58.1 — 2026-10-19
+- **Texturas em alta qualidade** (ligada por padrão nos Ajustes rápidos): desde a 0.0.13 o port
+  nunca informava ao jogo quais texturas estavam em uso, e ele não carregava as versões de alta
+  resolução (folhas da árvore da abertura e pedras borradas). Desligada, volta ao comportamento
+  antigo, para placas com pouca memória de vídeo.
+- **Ícone da janela do jogo:** um desenho do port (o menino erguendo a espada), para não ficar igual
+  ao do lançador na barra de tarefas. Em Imagem e FPS: padrão, o ícone do jogo ou uma imagem sua.
+
+## 0.58 — 2026-10-19
+Versão da comunidade: junta as pull requests e forks de várias pessoas, revisados e testados juntos.
+Obrigado a **Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy e tabnul**.
+
+**Estabilidade**
+- **Quedas por falta de memória de vídeo** (`EnsureResident: Assertion Failed`, placas AMD e de
+  4–6 GB): a memória dos buffers vem em blocos de 64 MB (antes milhares de alocações, acima do
+  limite dos drivers) e a memória parada é devolvida com o uso, conferindo os dados antes
+  (Gabriell-os #98, Oussama268 #59/#83/#103).
+- **Jogo congelando** ("GPU hook queue overflow"): a fila de avisos de memória cresce sob demanda.
+- **Queda depois do 1º e do 2º colosso no modo PS4 Pro** (`0x1a371`): o modo Pro recebe a
+  memória de um PS4 Pro (Lucas-blip-png #106).
+- Pacote de preenchimento na fila de compute que corrompia o pacote seguinte; arredondamento RTZ
+  desligado na NVIDIA (o driver travava); trava de regiões sem deadlock no Windows (jownatan #81).
+
+**Desempenho:** demo da tela de título 54–55 → **62 FPS de média**, mínima 26 → 31; memória de
+vídeo ~4,3 → ~2,7 GB (cortes no processador de comandos, pipelines compilados em segundo plano,
+caches lidos em paralelo, sombras distantes reaproveitadas).
+
+**AMD:** bloco preto no canto da tela nas RDNA3/RDNA4 (#43) e texturas BC5/BC6H (xeodeo);
+ramos uniformes de wave64 e envio periódico ligados na AMD (Gabriell-os #98). Ainda sem teste
+numa AMD aqui: conte nas issues.
+
+**Novidades**
+- **Widescreen / ultrawide:** 16:10, 21:9 e 32:9 com imagem mais larga, sem esticar (tabnul #54).
+- **FPS: 30 / 60 / ilimitado** no lançador.
+- **Ícones dos botões Xbox** no jogo (A B X Y, RB, LT/RT, Menu, View), desenhados para o port;
+  opção PlayStation / Xbox em Controles (mecanismo de troca de texturas do xeodeo).
+- **Geração de quadros (experimental):** FSR 3 em qualquer placa e DLSS-G nas RTX 40/50 (runtime
+  oficial da NVIDIA no pacote, com as licenças), com o jogo a 30 → 60 na tela (nakaionyt/y7ngboy).
+  Só faz diferença com o FPS em 30, e a barra de vida/stamina pode tremer.
+- Overlay de desempenho (F10), F7 liga/desliga o limite de 30, F8 troca a geração de quadros.
+- **Lançador em espanhol, chinês, coreano e russo.**
+- Janela com o ícone do jogo e, no título, a versão e o FPS.
+- **Lista de saves com a imagem de cada save**, como no PS4 / shadPS4.
+- **Tela de carregamento** com barra de porcentagem enquanto o cache de shaders é lido.
+- Idioma escolhido já na primeira tela do lançador; Modo PS4 Pro e Nitidez (RCAS) nos Ajustes rápidos.
+- O cache de shaders é refeito na primeira abertura.
+
 ## 0.57-opt8 — 2026-10-20 (fork Oussama268)
 - **Sem tela preta depois de atualizar o driver de vídeo:** com o cache do driver vazio, o port
   montava todos os pipelines guardados um por um antes de mostrar o jogo (98 s de janela preta,

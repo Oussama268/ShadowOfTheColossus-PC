@@ -332,8 +332,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // NVIDIA's shader compiler (seen on 617.14) hits a breakpoint on any OpFDiv in a shader
     // with RoundingModeRTZ for that width, killing the process. Prefer default rounding there.
     const bool rtz_usable = instance.GetDriverID() != vk::DriverId::eNvidiaProprietary;
-    Shader::Optimization::SetWave64UniformBranchesDefault(instance.GetDriverID() ==
-                                                          vk::DriverId::eNvidiaProprietary);
+    // Wave64 uniform branches on every driver. Tested on a Radeon RX 6650 XT (32-wide path):
+    // off, the shadows next to the Wander and Agro on grass get horizontal stripes; on, the
+    // image is right and the characters are not black in the shade (save with 5 colossi).
+    Shader::Optimization::SetWave64UniformBranchesDefault(true);
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
@@ -391,6 +393,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
+    WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
@@ -411,8 +414,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             async_workers.emplace_back([this](std::stop_token token) { AsyncPipelineWorker(token); });
         }
     }
-    // sotc: after the workers start, which build the preloaded pipelines (SOTC_ASYNC_PRELOAD).
-    WarmUp();
 }
 
 PipelineCache::~PipelineCache() = default;
@@ -460,27 +461,10 @@ bool PipelineCache::AsyncPipelineEligible() const {
     return true;
 }
 
-// sotc: SOTC_ASYNC_PRELOAD=0 builds the cached pipelines at boot on the command processor, one
-// after the other, as before. With an empty driver cache (a driver update) that took ~100 s of
-// black window; the workers now build them while the game starts, and a draw whose pipeline is
-// not built yet is skipped (a compute bind waits for it, as for any deferred compute pipeline).
-bool PipelineCache::AsyncPreloadEnabled() const {
-    static const bool enabled = [] {
-        const char* v = std::getenv("SOTC_ASYNC_PRELOAD");
-        return !v || v[0] != '0';
-    }();
-    return enabled && !async_workers.empty() && !EmulatorSettings.IsShaderCollect();
-}
-
-void PipelineCache::QueueAsyncPipeline(u64 hash,
-                                       const GraphicsPipeline::SerializationSupport* preloaded) {
+void PipelineCache::QueueAsyncPipeline(u64 hash) {
     auto job = std::make_unique<AsyncPipelineJob>();
     job->key = graphics_key;
     job->hash = hash;
-    if (preloaded) {
-        job->preloaded = true;
-        job->sdata = *preloaded; // the cached vertex layout the pipeline is built from
-    }
     job->infos = infos;
     job->runtime_infos = runtime_infos;
     if (fetch_shader) {
@@ -542,7 +526,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
         job->pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, job->key, *pipeline_cache, job->infos,
             job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules,
-            job->sdata, job->preloaded, true);
+            job->sdata, false, true);
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         std::scoped_lock lock{async_mutex};
         async_done.push_back(std::move(job));
@@ -567,9 +551,6 @@ void PipelineCache::CollectAsyncPipelines() {
             continue;
         }
         it.value() = std::move(job->pipeline);
-        if (job->preloaded) {
-            continue; // already in the cache
-        }
         RegisterPipelineData(job->key, job->hash, job->sdata);
         ++num_new_pipelines;
     }
@@ -750,6 +731,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             QueueAsyncPipeline(pipeline_hash);
             return nullptr; // the draws that need it are skipped until it is ready
         }
+        const SotcStats::ScopedTimer stall_timer{SotcStats::pipeline_ns};
+        SotcStats::pipelines_new.fetch_add(1, std::memory_order_relaxed);
         const auto sync_start = std::chrono::steady_clock::now();
 
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
@@ -790,6 +773,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        const SotcStats::ScopedTimer stall_timer{SotcStats::pipeline_ns};
+        SotcStats::pipelines_new.fetch_add(1, std::memory_order_relaxed);
 
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
@@ -1076,6 +1061,8 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
     }
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+    const SotcStats::ScopedTimer stall_timer{SotcStats::shader_ns};
+    SotcStats::shaders_compiled.fetch_add(1, std::memory_order_relaxed);
 
     auto phase_start = std::chrono::steady_clock::now();
     const auto phase = [&](int i) {

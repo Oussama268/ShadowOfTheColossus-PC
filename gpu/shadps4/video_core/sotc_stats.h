@@ -25,6 +25,7 @@ inline std::atomic<uint64_t> watch_addr{0};     ///< SOTC_CS_WATCH: GPU writes t
 inline std::atomic<uint64_t> current_program{0}; ///< hash of the dispatch being recorded (1 = a draw)
 inline std::atomic<uint64_t> readback_ahead{0};   ///< downloads of already submitted work
 inline std::atomic<uint64_t> readback_finish{0};  ///< downloads that flushed the current work
+inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the guest itself asked
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
 inline std::atomic<uint64_t> readback_copies{0};          ///< ranges downloaded
 inline std::atomic<uint64_t> readback_copies_changed{0};  ///< ... whose bytes differed from memory
@@ -64,12 +65,24 @@ inline uint64_t TakeDelta(const std::atomic<uint64_t>& counter, uint64_t& seen) 
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};
 inline std::atomic<uint64_t> early_flushes{0}; ///< submits right after a write to a read-back page
-inline std::atomic<uint64_t> vram_used{0};      ///< device-local usage (VK_EXT_memory_budget), bytes
-inline std::atomic<uint64_t> vram_budget{0};    ///< device-local budget the texture cache plans for
+/// Suspects of long frames, printed for each frame over SOTC_STALL_MS (SOTC_FRAME_LOG runs):
+/// pipelines created, shaders recompiled and images created during the frame, and their time.
+inline std::atomic<uint64_t> pipelines_new{0}, pipeline_ns{0};
+inline std::atomic<uint64_t> shaders_compiled{0}, shader_ns{0};
+inline std::atomic<uint64_t> images_new{0}, image_ns{0};
+/// Parts of an image creation: format query, memory allocation (and how many got memory of
+/// their own instead of a block shared with others).
+inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicated{0};
+/// Video memory: usage the driver reports (texture cache GC), budget the GC works with, and the
+/// sparse buffer arena memory (never released) as allocations and bytes.
+inline std::atomic<uint64_t> vram_used{0}, vram_budget{0}, arena_allocs{0}, arena_bytes{0};
+/// Texture cache collector: ticks (one per submit with a frame's work), images freed and those
+/// written back to memory first, and the images in the cache with their (guest) size.
+inline std::atomic<uint64_t> gc_ticks{0}, gc_freed{0}, gc_downloads{0};
+inline std::atomic<uint64_t> cached_images{0}, cached_image_bytes{0};
 inline std::atomic<uint64_t> vram_emergency{0}; ///< emergency texture collections (allocation failed)
 inline std::atomic<uint64_t> write_fault_gpu_pending{0}; ///< write-fault readbacks left protected
 inline std::atomic<uint64_t> write_fault_stale_gpu{0};   ///< ... that cleared a stale GPU page bit
-inline std::atomic<uint64_t> arena_bytes{0};    ///< resident buffer arena memory
 inline std::atomic<uint64_t> arena_evicted{0};  ///< arena bytes given back by MaybeEvictCold
 inline std::atomic<uint64_t> arena_rebound{0};  ///< ... bound again afterwards
 inline std::atomic<uint64_t> arena_pinned{0};   ///< ... faulted back in by shaders (kept since)
@@ -91,7 +104,6 @@ inline std::atomic<uint64_t> async_translate_skips{0}; ///< draws skipped while 
 inline std::atomic<uint64_t> srt_walker_faults{0};
 inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images
 inline std::atomic<uint64_t> image_count{0};
-inline std::atomic<uint64_t> gc_freed{0};       ///< images freed by the texture garbage collector
 inline std::atomic<uint64_t> gc_kept_tiled{0};  ///< GC candidates kept: GPU-written tiled images
 inline std::atomic<uint64_t> vma_block_bytes{0};      ///< VMA device-local blocks
 inline std::atomic<uint64_t> vma_allocation_bytes{0}; ///< ... and the allocations inside them
@@ -177,6 +189,28 @@ inline constexpr const char* kFrameCauseNames[FrameCauses] = {
 inline std::atomic<uint64_t> frame_copy_bytes{0};
 inline std::atomic<uint64_t> frame_ns[FrameCauses]{};
 inline std::atomic<uint64_t> frame_compiles{0}; ///< shader modules and pipelines created
+/// sotc: shader cache preload at boot (loading screen bar): pipelines to load and loaded.
+inline std::atomic<uint32_t> warmup_total{0}, warmup_done{0};
+inline std::atomic<uint64_t> flip_count{0};     ///< game flips (videoout/driver.cpp Flip)
+/// Game frames prepared by the command processor (vk_presenter.cpp PrepareFrame): unlike
+/// flip_count, in step with the draws the command processor is processing.
+inline std::atomic<uint64_t> cp_frame{0};
+/// sotc: what the in-game performance overlay shows (bbport_overlay.cpp, show_fps / F10),
+/// published by the SOTC_FPS printer at the end of each five-second window (videoout/driver.cpp).
+inline std::atomic<float> ov_cmds_per_frame{0.0f};
+inline std::atomic<float> ov_readbacks_per_s{0.0f};
+inline std::atomic<float> ov_readback_ms_per_s{0.0f};
+inline std::atomic<uint32_t> ov_compiles_window{0};
+inline std::atomic<uint64_t> ov_compiles_total{0};
+inline std::atomic<int> ov_worst_cause{-1}; ///< FrameCause that took most of the worst frame
+inline std::atomic<float> ov_worst_cause_ms{0.0f};
+/// DLSS Frame Generation (vk_dlssg.cpp): -1 not loaded, 0 off, 1 on, 2 error; frames shown per
+/// game frame; sl::DLSSGStatus bits.
+inline std::atomic<int> ov_fg_state{-1};
+inline std::atomic<uint32_t> ov_fg_frames{0};
+inline std::atomic<uint32_t> ov_fg_status{0};
+/// FSR 3 frame generation (vk_fsrfg.cpp): 0 waiting for a 3D scene, 1 generating, 2 error.
+inline std::atomic<int> ov_fsr_state{0};
 /// Phases of PipelineCache::CompileModule (SOTC_FPS, "SOTC COMPILE" line): translate, emit SPIR-V,
 /// shader patch lookup, vkCreateShaderModule, cache registration.
 inline std::atomic<uint64_t> compile_phase_ns[5]{};

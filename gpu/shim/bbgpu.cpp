@@ -35,6 +35,7 @@
 #include "core/emulator_settings.h"
 #include "core/signals.h"
 #include "sdl_window.h"
+#include "video_core/cache_storage.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -324,6 +325,8 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
                 SDL_Delay(50);
             }
         }
+        // sotc: write the pipelines still queued for the cache before leaving.
+        Storage::DataBase::Instance().Close();
         std::fflush(stdout);
         std::_Exit(0);
     });
@@ -486,9 +489,23 @@ static bool ShotWithOverlay() {
     static const bool with = std::getenv("SOTC_SHOT_OVERLAY") != nullptr;
     return with;
 }
+// SOTC_SHOT_COUNT=<n>: the trigger saves the next n game frames in a row (checking flicker).
 u32 ConsumeGameOnlyScreenshotRequests() {
     static const char* trigger = std::getenv("BB_FRAME_DUMP_TRIGGER");
-    return !ShotWithOverlay() && trigger && std::remove(trigger) == 0 ? 1 : 0;
+    static const int count = [] {
+        const char* v = std::getenv("SOTC_SHOT_COUNT");
+        return v ? std::max(1, std::atoi(v)) : 1;
+    }();
+    static int remaining = 0;
+    if (remaining > 0) {
+        --remaining;
+        return 1;
+    }
+    if (!ShotWithOverlay() && trigger && std::remove(trigger) == 0) {
+        remaining = count - 1;
+        return 1;
+    }
+    return 0;
 }
 bool ConsumeImageDumpRequest() { return false; } // sotc: SOTC_DUMP needs RenderDoc hooks
 u32 ConsumeWithOverlaysScreenshotRequests() {
@@ -510,6 +527,13 @@ extern "C" int bbgpu_save_list_open(const char* title, const char* const* items,
         list.emplace_back(items[i] ? items[i] : "");
     }
     return BbOverlay::OpenSaveList(title ? title : "", list, focus, first_deletable) ? 1 : 0;
+}
+extern "C" void bbgpu_save_list_icons(const char* const* paths, int count) {
+    std::vector<std::string> list;
+    for (int i = 0; i < count; ++i) {
+        list.emplace_back(paths && paths[i] ? paths[i] : "");
+    }
+    BbOverlay::SetSaveListIcons(std::move(list));
 }
 extern "C" int bbgpu_save_list_poll(void) {
     return BbOverlay::PollSaveList();

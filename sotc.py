@@ -15,8 +15,7 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
     SOTC_DLC_DIR      optional: the game's DLC (one folder per add-on with sce_sys/param.sfo,
                       or shadPS4's addcont folder holding CUSA08809)
     SOTC_MODES        optional, comma-separated: af16 (16x anisotropic filtering),
-                      fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz, at most
-                      60 FPS unless SOTC_FPS_CAP=0: the launcher's "Unlocked FPS")
+                      fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz)
     SOTC_RENDER_RES   optional: the game renders at WxH instead of 1920x1080 (e.g. 2560x1080 for
                       21:9, a wider view); the output follows its aspect; PS4 mode only; at most 1080
                       lines tall and 4.2 million pixels, larger sizes are scaled down
@@ -85,6 +84,30 @@ def cap_render(size):
     except ValueError:
         return size  # sotc_modes.py reports it
     if w <= 0 or h <= 0:
+        return size  # sotc_modes.py reports it
+    scale = min(1.0, MAX_RENDER_HEIGHT / h, (MAX_RENDER_PIXELS / (w * h)) ** 0.5)
+    if scale == 1.0:
+        return size
+    capped = f'{int(w * scale) // 8 * 8}x{int(h * scale) // 8 * 8}'
+    print(f'sotc: render size {size} is above {MAX_RENDER_HEIGHT} lines or {MAX_RENDER_PIXELS:,} pixels '
+          f'(fine textures disappear), rendering at {capped}', file=sys.stderr)
+    return capped
+
+
+# Above about 4.2 million rendered pixels the fine detail textures (ground, cloth) shimmer, flicker
+# and then disappear (2736x1536 is fine, 3008x1696 shimmers, 3840x2160 has none); cause unknown.
+# The game itself never renders more than 1080 lines in PS4 mode, so the render height stays at
+# most 1080 (3840x1080 for 32:9 is tested fine) and the pixel limit covers wider aspects.
+MAX_RENDER_HEIGHT = 1080
+MAX_RENDER_PIXELS = 4_200_000
+
+
+def cap_render(size):
+    """SOTC_RENDER_RES WxH, scaled down (same aspect, multiples of 8) to MAX_RENDER_HEIGHT lines
+    and MAX_RENDER_PIXELS."""
+    try:
+        w, h = map(int, size.split('x'))
+    except ValueError:
         return size  # sotc_modes.py reports it
     scale = min(1.0, MAX_RENDER_HEIGHT / h, (MAX_RENDER_PIXELS / (w * h)) ** 0.5)
     if scale == 1.0:
@@ -200,9 +223,11 @@ def main():
     if cvars is None:
         # Without the launcher: the culling settings of Pink-shadPS4 (same image, fewer GPU waits).
         cvars = 'doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0'
+    if env.get('SOTC_NOTE'):
+        print(f"sotc: {env['SOTC_NOTE']}", file=sys.stderr)
     render = cap_render(env.get('SOTC_RENDER_RES', '').strip())
     if render == '1920x1080':
-        # A 16:9 output above 1080p renders at 1080p as before: no patches, no extra memory.
+        # A 16:9 output above 1080p renders at 1080p as before: no render patches, no UI filter.
         render = ''
     if render:
         env['SOTC_RENDER_RES'] = render  # the GPU library reads it (bilinear 2D art above 1080p)
@@ -222,12 +247,16 @@ def main():
             env['SOTC_OUTPUT_RES'] = render
         # Larger render targets: the game's heaps take what direct memory there is (run.sh).
         env.setdefault('BB_DMEM_MB', '9152')
-    if 'fps60' in modes.lower():
-        # The game waits for vblanks: at 60 Hz an uncapped frame still rounds up to 30 FPS.
-        env.setdefault('BB_VBLANK_HZ', '120')
-        # At most 60 FPS, as on a PS4 Pro: the game was never made to run faster (SOTC_FPS_CAP=0
-        # removes the cap).
-        env.setdefault('SOTC_FPS_CAP', '60')
+    # The game's direct memory allocator (a 64 KiB page bitmap over all of it) filled up and read
+    # past the bitmap (guest offset 0x1a371, read of -1): in PS4 Pro mode with 5696 MiB when a save
+    # loaded, and in PS4 mode with 5056 MiB on loading the last colossus' area (user logs, 19
+    # Oct; high quality textures keep more fine mips resident than on a PS4). Every mode gets the
+    # 9152 MiB the wide render sizes already used.
+    env.setdefault('BB_DMEM_MB', '9152')
+    # The game waits for vblanks: at 60 Hz an uncapped frame (fps60, or F7 in game) still rounds
+    # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
+    # in 120 Hz vblanks).
+    env.setdefault('BB_VBLANK_HZ', '120')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).

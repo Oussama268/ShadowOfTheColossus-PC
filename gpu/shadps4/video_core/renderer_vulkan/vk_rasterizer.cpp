@@ -1,13 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <chrono>
+#include <cstdio>
+#include <map>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
+#include <vector>
 #include <algorithm>
 #include <filesystem>
 #include "common/path_util.h"
@@ -23,6 +28,8 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
+#include "video_core/renderer_vulkan/vk_shadow_scroll.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/buffer_cache/region_manager.h"
@@ -213,13 +220,483 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+// sotc: SOTC_PASS_TRACE=1: every 300 flips, the render passes of one frame in order (depth
+// target, its size, colour target 0, screen and generic scissors, CB mode, draws) on stderr.
+// A diagnostic for finding which passes are the sun shadow cascades.
+template <typename Regs>
+static void TracePass(const Regs& regs) {
+    static const bool on = std::getenv("SOTC_PASS_TRACE") != nullptr;
+    if (!on) {
+        return;
+    }
+    struct Pass {
+        u64 depth, color;
+        u32 pitch, height, mode, slice0, slice1;
+        s32 sx0, sy0, sx1, sy1, gx0, gy0, gx1, gy1;
+        u32 draws;
+        u64 mrt_key; // the bound colour targets (address and format of each)
+        char mrts[320];
+    };
+    static std::vector<Pass> passes;
+    static u64 frame_seen = 0;
+    const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (frame != frame_seen) {
+        if (frame_seen % 300 == 0 && !passes.empty()) {
+            std::fprintf(stderr, "SOTC PASSES frame %llu: %zu passes\n",
+                         static_cast<unsigned long long>(frame_seen), passes.size());
+            for (const auto& p : passes) {
+                std::fprintf(stderr,
+                             "  depth %#llx %ux%u slices %u-%u color %#llx mode %u screen %d,%d-%d,%d "
+                             "generic %d,%d-%d,%d draws %u | mrt %s\n",
+                             static_cast<unsigned long long>(p.depth), p.pitch, p.height, p.slice0, p.slice1,
+                             static_cast<unsigned long long>(p.color), p.mode, p.sx0, p.sy0,
+                             p.sx1, p.sy1, p.gx0, p.gy0, p.gx1, p.gy1, p.draws, p.mrts);
+            }
+        }
+        passes.clear();
+        frame_seen = frame;
+    }
+    if (frame % 300 != 0) {
+        return;
+    }
+    Pass p{
+        .depth = regs.depth_buffer.DepthValid() ? regs.depth_buffer.DepthWriteAddress() : 0,
+        .color = regs.color_buffers[0].Address(),
+        .pitch = regs.depth_buffer.Pitch(),
+        .height = regs.depth_buffer.Height(),
+        .mode = static_cast<u32>(regs.color_control.mode),
+        .slice0 = regs.depth_view.slice_start,
+        .slice1 = regs.depth_view.slice_max,
+        .sx0 = regs.screen_scissor.top_left_x,
+        .sy0 = regs.screen_scissor.top_left_y,
+        .sx1 = regs.screen_scissor.bottom_right_x,
+        .sy1 = regs.screen_scissor.bottom_right_y,
+        .gx0 = regs.generic_scissor.top_left_x,
+        .gy0 = regs.generic_scissor.top_left_y,
+        .gx1 = regs.generic_scissor.bottom_right_x,
+        .gy1 = regs.generic_scissor.bottom_right_y,
+        .draws = 1,
+        .mrt_key = 0,
+        .mrts = {},
+    };
+    for (u32 i = 0; i < 8; ++i) {
+        const auto& cb = regs.color_buffers[i];
+        if (cb) {
+            p.mrt_key = p.mrt_key * 0x100000001b3ull ^ cb.Address() ^
+                        (u64(cb.info.format) << 56) ^ (u64(i) << 60);
+        }
+    }
+    if (!passes.empty()) {
+        auto& last = passes.back();
+        if (last.depth == p.depth && last.color == p.color && last.pitch == p.pitch &&
+            last.mrt_key == p.mrt_key &&
+            last.height == p.height && last.mode == p.mode && last.slice0 == p.slice0 &&
+            last.slice1 == p.slice1 && last.sx0 == p.sx0 &&
+            last.sy0 == p.sy0 && last.sx1 == p.sx1 && last.sy1 == p.sy1 && last.gx0 == p.gx0 &&
+            last.gy0 == p.gy0 && last.gx1 == p.gx1 && last.gy1 == p.gy1) {
+            ++last.draws;
+            return;
+        }
+    }
+    int at = 0;
+    for (u32 i = 0; i < 8 && at < int(sizeof(p.mrts)) - 64; ++i) {
+        const auto& cb = regs.color_buffers[i];
+        if (cb) {
+            at += std::snprintf(p.mrts + at, sizeof(p.mrts) - at, "%u:%#llx d%u n%u %ux%u ", i,
+                                static_cast<unsigned long long>(cb.Address()),
+                                static_cast<u32>(cb.GetDataFmt()), static_cast<u32>(cb.GetNumberFmt()),
+                                cb.Pitch(), cb.Height());
+        }
+    }
+    passes.push_back(p);
+}
+
+// sotc: SOTC_PASS_TRACE: with the pass list, the shader hashes (all stages, as the dump file
+// names) of the G-buffer draws, recognised by their R16G16 float target in MRT 4.
+template <typename Regs, typename Pipe>
+static void TraceGbufferShaders(const Regs& regs, const Pipe* pipeline) {
+    static const bool on = std::getenv("SOTC_PASS_TRACE") != nullptr;
+    if (!on || !pipeline) {
+        return;
+    }
+    static std::map<std::array<u64, 6>, u32> counts;
+    static u64 frame_seen = 0;
+    const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (frame != frame_seen) {
+        if (frame_seen % 300 == 0 && !counts.empty()) {
+            std::fprintf(stderr, "SOTC GBUFFER SHADERS frame %llu:\n",
+                         static_cast<unsigned long long>(frame_seen));
+            for (const auto& [key, draws] : counts) {
+                std::fprintf(stderr, "  draws %4u:", draws);
+                for (u64 hash : key) {
+                    if (hash) {
+                        std::fprintf(stderr, " %#018llx", static_cast<unsigned long long>(hash));
+                    }
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+        counts.clear();
+        frame_seen = frame;
+    }
+    if (frame % 300 != 0) {
+        return;
+    }
+    const auto& cb4 = regs.color_buffers[4];
+    if (!cb4 || cb4.GetDataFmt() != AmdGpu::DataFormat::Format16_16 ||
+        cb4.GetNumberFmt() != AmdGpu::NumberFormat::Float) {
+        return;
+    }
+    std::array<u64, 6> key{};
+    size_t n = 0;
+    for (const auto* info : pipeline->GetStages()) {
+        if (info && n < key.size()) {
+            key[n++] = info->pgm_hash;
+        }
+    }
+    ++counts[key];
+}
+
+// sotc: SOTC_PASS_TRACE: the shader hashes of the draws into square depth targets of 512+ texels
+// (the sun shadow map's cascades) per slice, every 300 flips.
+template <typename Regs, typename Pipe>
+static void TraceShadowShaders(const Regs& regs, const Pipe* pipeline) {
+    static const bool on = std::getenv("SOTC_PASS_TRACE") != nullptr;
+    if (!on || !pipeline || !regs.depth_buffer.DepthValid()) {
+        return;
+    }
+    static std::map<std::pair<u32, u64>, u32> counts;
+    static u64 frame_seen = 0;
+    const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (frame != frame_seen) {
+        if (frame_seen % 300 == 0 && !counts.empty()) {
+            std::fprintf(stderr, "SOTC SHADOW SHADERS frame %llu:\n",
+                         static_cast<unsigned long long>(frame_seen));
+            for (const auto& [key, draws] : counts) {
+                std::fprintf(stderr, "  slice %u vs %#018llx draws %u\n", key.first,
+                             static_cast<unsigned long long>(key.second), draws);
+            }
+        }
+        counts.clear();
+        frame_seen = frame;
+    }
+    if (frame % 300 != 0) {
+        return;
+    }
+    const u32 pitch = regs.depth_buffer.Pitch();
+    if (pitch != regs.depth_buffer.Height() || pitch < 512) {
+        return;
+    }
+    const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+    ++counts[{regs.depth_view.slice_start, vs.pgm_hash}];
+}
+
+// sotc: SOTC_SHADOW_STAGGER=1: the two farthest sun shadow cascades are redrawn on alternate
+// frames (slice 2 on odd flips, slice 3 on even ones). A skipped slice starts no render pass, so
+// it is not cleared and keeps the previous frame's shadows. The sun shadow map is the square
+// depth target that got the most draws in the previous frame (SotC: 1024x1024, 5 slices, ~6500
+// draws per frame, 3041 of them in slice 3 and 2049 in slice 2, SOTC_PASS_TRACE). Far shadows
+// then lag one frame behind the camera; the two slices cost half as much.
+template <typename Regs>
+static bool SkipStaggeredShadow(const Regs& regs) {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_SHADOW_STAGGER");
+        return v && v[0] == '1';
+    }();
+    if (!on) {
+        return false;
+    }
+    static u64 frame_seen = 0, sun_map = 0;
+    static std::unordered_map<u64, u32> counts; // draws per square depth target this frame
+    const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (frame != frame_seen) {
+        u64 most_addr = 0;
+        u32 most = 0;
+        for (const auto& [addr, draws] : counts) {
+            if (draws > most) {
+                most = draws;
+                most_addr = addr;
+            }
+        }
+        sun_map = most >= 500 ? most_addr : 0;
+        counts.clear();
+        frame_seen = frame;
+    }
+    if (!regs.depth_buffer.DepthValid() ||
+        regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal) {
+        return false;
+    }
+    const u32 pitch = regs.depth_buffer.Pitch();
+    if (pitch != regs.depth_buffer.Height() || pitch < 512) {
+        return false;
+    }
+    const u64 addr = regs.depth_buffer.DepthWriteAddress();
+    ++counts[addr];
+    if (addr != sun_map) {
+        return false;
+    }
+    const u32 slice = regs.depth_view.slice_start;
+    return slice == 2 ? (frame & 1) != 0 : slice == 3 ? (frame & 1) == 0 : false;
+}
+
+// sotc: SOTC_SHADOW_REUSE (default 1; 0 = off, check = verify once and save the result): the far
+// sun shadow cascades (slices 2 and 3 of the sun shadow map, the square depth target with the
+// most draws in the previous frame; ~2000 draws each) are drawn on alternate frames, and on the
+// other frames last frame's cascade is moved instead (vk_shadow_scroll.h). The engine snaps its
+// cascades to texels: between two frames only the translation of a cascade's (orthographic)
+// light matrix changes, by whole texels in x and y. Moving last frame's texels by that many
+// texels, and their depths by the z change, gives the cascade a redraw would (except for things
+// that moved since, whose far shadows update every other frame, and the few texels entering at
+// the edge). The light matrix is the shadow view's world -> clip at +0x80 of the view
+// constants, as for the camera (*(*(VS user data 0..1) + 8), vk_dlssg.cpp). Any other change
+// (rotation, scale, viewport, a non-whole-texel or large move): the cascade is drawn. Unlike
+// SOTC_SHADOW_STAGGER (texels of another matrix: shadows jumping as the camera moved), a reused
+// cascade always matches the matrix the lighting uses.
+namespace {
+struct ShadowReuseState {
+    static constexpr u32 kSlices = 8;
+    u64 frame_seen = 0, sun_map = 0;
+    std::unordered_map<u64, u32> counts; // draws per square depth target this frame
+    std::array<std::array<float, 16>, kSlices> last_vp{};
+    std::array<std::array<float, 3>, kSlices> last_scale{};
+    std::array<bool, kSlices> have_vp{}, decided{}, skip{}, drawn_prev{}, drawn_now{};
+    // The light matrix a slice was decided for this frame, and the image it was drawn into.
+    std::array<std::array<float, 16>, kSlices> decided_vp{};
+    std::array<VideoCore::ImageId, kSlices> last_image{};
+    std::array<u64, kSlices> last_image_uid{};
+    u64 prev_key = 0; // target of the previous draw (address * 8 + slice), 0: another kind
+    u64 drawn = 0, scrolled = 0, refused = 0, invalid = 0, rendered_again = 0, image_changed = 0;
+    s32 check_slice = -1; // verification: the slice scrolled into the scratch image
+    bool check_done = false;
+};
+} // namespace
+
+bool Rasterizer::ReuseShadowCascade() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_SHADOW_REUSE");
+        if (!v) {
+            return 1;
+        }
+        return v[0] == '0' ? 0 : (v[0] == 'c' ? 2 : 1);
+    }();
+    if (mode == 0) {
+        return false;
+    }
+    static ShadowReuseState s;
+    const auto& regs = liverpool->DrawRegs(); // sotc: the draw thread's copy there
+    const u64 frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
+    if (frame != s.frame_seen) {
+        u64 most_addr = 0;
+        u32 most = 0;
+        for (const auto& [addr, draws] : s.counts) {
+            if (draws > most) {
+                most = draws;
+                most_addr = addr;
+            }
+        }
+        if ((most >= 500 ? most_addr : 0) != s.sun_map) {
+            s.have_vp.fill(false); // another shadow map: nothing to reuse
+        }
+        s.sun_map = most >= 500 ? most_addr : 0;
+        s.counts.clear();
+        s.drawn_prev = s.drawn_now;
+        s.drawn_now.fill(false);
+        s.decided.fill(false);
+        s.frame_seen = frame;
+        // Every ~60 s in the log (every 300 frames with SOTC_SHADOW_REUSE_STATS).
+        static const bool stats = std::getenv("SOTC_SHADOW_REUSE_STATS") != nullptr;
+        if (frame % (stats ? 300 : 1800) == 0) {
+            std::fprintf(stderr,
+                         "SOTC SHADOW REUSE: far cascades drawn %llu, moved %llu, refused %llu, "
+                         "unreadable %llu, drawn twice in a frame %llu, image changed %llu\n",
+                         static_cast<unsigned long long>(s.drawn),
+                         static_cast<unsigned long long>(s.scrolled),
+                         static_cast<unsigned long long>(s.refused),
+                         static_cast<unsigned long long>(s.invalid),
+                         static_cast<unsigned long long>(s.rendered_again),
+                         static_cast<unsigned long long>(s.image_changed));
+            s.drawn = s.scrolled = s.refused = s.invalid = s.rendered_again = s.image_changed = 0;
+        }
+    }
+    const bool square_depth =
+        regs.depth_buffer.DepthValid() &&
+        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Normal &&
+        regs.depth_buffer.Pitch() == regs.depth_buffer.Height() && regs.depth_buffer.Pitch() >= 512;
+    const u64 addr = square_depth ? regs.depth_buffer.DepthWriteAddress() : 0;
+    const u32 slice = regs.depth_view.slice_start;
+    const u64 key = square_depth ? addr * 8 + (slice & 7) : 0;
+    const bool new_run = key != s.prev_key; // first draw after draws into another target
+    s.prev_key = key;
+    if (!square_depth) {
+        return false;
+    }
+    ++s.counts[addr];
+    if (addr != s.sun_map || (slice != 2 && slice != 3)) {
+        return false;
+    }
+    if (s.decided[slice] && !new_run) {
+        return s.skip[slice];
+    }
+
+    // The cascade's light matrix (rows at +0x80 of the shadow view's constants).
+    constexpr u64 kMask48 = 0xFFFFFFFFFFFFull;
+    const u64 ud =
+        (u64(regs.vs_program.user_data[0]) | (u64(regs.vs_program.user_data[1]) << 32)) & kMask48;
+    u64 cb = 0;
+    std::array<float, 16> vp{};
+    bool valid = ud && memory->TryReadBacking(ud + 8, &cb, sizeof(cb)) && (cb &= kMask48) &&
+                 memory->TryReadBacking(cb + 0x80, vp.data(), sizeof(vp));
+    if (valid) {
+        for (float f : vp) {
+            valid &= std::isfinite(f);
+        }
+        // Orthographic (sun light): the w row is (0, 0, 0, 1).
+        valid &= vp[12] == 0.0f && vp[13] == 0.0f && vp[14] == 0.0f && vp[15] == 1.0f;
+    }
+    const auto& viewport = regs.viewports[0];
+    const std::array<float, 3> scale{
+        regs.viewport_control.xscale_enable ? viewport.xscale : 1.0f,
+        regs.viewport_control.yscale_enable ? viewport.yscale : 1.0f,
+        regs.viewport_control.zscale_enable ? viewport.zscale : 1.0f};
+    // The image the cascade goes to: a moved cascade needs last frame's texels in the same image.
+    VideoCore::ImageId image_id{};
+    u64 image_uid = 0;
+    if (valid) {
+        const auto texture_lock = texture_cache.BatchLock();
+        const auto htile = regs.depth_htile_data_base.GetAddress();
+        VideoCore::TextureCache::ImageDesc desc(regs.depth_buffer, regs.depth_view,
+                                                regs.depth_control, htile,
+                                                liverpool->DrawDbExtent());
+        image_id = texture_cache.FindImage(desc);
+        image_uid = texture_cache.GetImage(image_id).image_uid;
+    }
+    if (s.decided[slice]) {
+        // Another run of draws into this slice in the same frame.
+        if (valid && vp == s.decided_vp[slice]) {
+            return s.skip[slice]; // the same cascade, drawn in several runs
+        }
+        // Drawn again with another light matrix before the flip (a second scene in one frame, as
+        // a slower machine may render): drawn as the game does, and a valid source next frame.
+        ++s.rendered_again;
+        ++s.drawn;
+        s.skip[slice] = false;
+        s.decided_vp[slice] = vp;
+        s.last_vp[slice] = vp;
+        s.last_scale[slice] = scale;
+        s.have_vp[slice] = valid;
+        s.drawn_now[slice] = true;
+        s.last_image[slice] = image_id;
+        s.last_image_uid[slice] = image_uid;
+        return false;
+    }
+    s.decided[slice] = true;
+    s.skip[slice] = false;
+    s.decided_vp[slice] = vp;
+
+    // Verification: the scratch image scrolled last frame against the cascade then drawn.
+    if (mode == 2 && s.check_slice >= 0 && !s.check_done && shadow_scroll) {
+        const auto texture_lock = texture_cache.BatchLock();
+        const auto htile = regs.depth_htile_data_base.GetAddress();
+        VideoCore::TextureCache::ImageDesc desc(regs.depth_buffer, regs.depth_view,
+                                                regs.depth_control, htile,
+                                                liverpool->DrawDbExtent());
+        auto& image = texture_cache.GetImage(texture_cache.FindImage(desc));
+        const char* dump_dir = std::getenv("BB_DUMP_DIR");
+        const auto dir = std::filesystem::path(dump_dir ? dump_dir : ".");
+        shadow_scroll->SaveCheck(
+            image, static_cast<u32>(s.check_slice),
+            (dir / ("shadow_check_slice" + std::to_string(s.check_slice))).string());
+        s.check_done = true;
+    }
+
+    bool moved = false;
+    const bool phase = (frame + slice) % 2 == 1; // each far cascade drawn every other frame
+    if (!valid) {
+        ++s.invalid;
+    } else if (s.have_vp[slice] && s.drawn_prev[slice] && phase) {
+        const auto& prev = s.last_vp[slice];
+        // Last frame's texels are in the image only if it is the same one (not recreated).
+        const bool same_image =
+            image_id == s.last_image[slice] && image_uid == s.last_image_uid[slice];
+        if (!same_image) {
+            ++s.image_changed;
+        }
+        bool same_basis = same_image && s.last_scale[slice] == scale;
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                same_basis &= vp[r * 4 + c] == prev[r * 4 + c];
+            }
+        }
+        const double fx = double(scale[0]) * (double(vp[3]) - prev[3]);
+        const double fy = double(scale[1]) * (double(vp[7]) - prev[7]);
+        const float dz = static_cast<float>(double(scale[2]) * (double(vp[11]) - prev[11]));
+        const double rx = std::round(fx), ry = std::round(fy);
+        const bool whole = std::abs(fx - rx) < 0.02 && std::abs(fy - ry) < 0.02 &&
+                           std::abs(rx) <= 128 && std::abs(ry) <= 128;
+        static u32 logged = 0;
+        if ((!same_basis || !whole) && std::getenv("SOTC_SHADOW_REUSE_STATS") && logged < 20) {
+            ++logged;
+            std::fprintf(stderr,
+                         "SOTC SHADOW REUSE refused slice %u: basis %s, move %.4f,%.4f texels, dz "
+                         "%g, scale %g %g %g (was %g %g %g)\n",
+                         slice, same_basis ? "same" : "changed", fx, fy, dz, scale[0], scale[1],
+                         scale[2], s.last_scale[slice][0], s.last_scale[slice][1],
+                         s.last_scale[slice][2]);
+        }
+        if (same_basis && whole) {
+            if (!shadow_scroll) {
+                shadow_scroll = std::make_unique<ShadowScroll>(instance, scheduler, runtime);
+            }
+            const auto texture_lock = texture_cache.BatchLock();
+            const auto htile = regs.depth_htile_data_base.GetAddress();
+            VideoCore::TextureCache::ImageDesc desc(regs.depth_buffer, regs.depth_view,
+                                                    regs.depth_control, htile,
+                                                    liverpool->DrawDbExtent());
+            auto& image = texture_cache.GetImage(texture_cache.FindImage(desc));
+            const bool check = mode == 2;
+            if (check && (s.check_slice >= 0 || (rx == 0 && ry == 0))) {
+                // Verification done or pending: draw as usual.
+            } else if (shadow_scroll->Scroll(image, slice, static_cast<s32>(rx),
+                                             static_cast<s32>(ry), dz, regs.depth_clear, check)) {
+                if (check) {
+                    s.check_slice = static_cast<s32>(slice);
+                    std::fprintf(stderr,
+                                 "SOTC SHADOW CHECK slice %u frame %llu shift %d,%d dz %g "
+                                 "(scale %g %g %g, clear %g, format %d)\n",
+                                 slice, static_cast<unsigned long long>(frame), int(rx), int(ry),
+                                 dz, scale[0], scale[1], scale[2], regs.depth_clear,
+                                 static_cast<int>(image.info.pixel_format));
+                } else {
+                    moved = true;
+                }
+            }
+        }
+        if (!moved && mode != 2) {
+            ++s.refused;
+        }
+    }
+    s.last_vp[slice] = vp;
+    s.last_scale[slice] = scale;
+    s.have_vp[slice] = valid;
+    s.last_image[slice] = image_id;
+    s.last_image_uid[slice] = image_uid;
+    s.skip[slice] = moved;
+    s.drawn_now[slice] = !moved;
+    ++(moved ? s.scrolled : s.drawn);
+    return moved;
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolved,
                       bool use_resolved) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
+    TracePass(liverpool->DrawRegs());
 
     if (!FilterDraw()) {
+        return;
+    }
+    if (SkipStaggeredShadow(liverpool->DrawRegs()) || ReuseShadowCascade()) {
         return;
     }
 
@@ -235,8 +712,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         SotcStats::Drop(0, regs.color_buffers[0].Address(), regs.stage_enable.raw);
         return;
     }
+    TraceGbufferShaders(regs, pipeline);
+    TraceShadowShaders(regs, pipeline);
 
     PrepareRenderState(pipeline);
+    if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of frame generation
+        Dlssg::NoteDraw(regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
+                        cb_descs[4].first, texture_cache);
+    }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, regs.color_buffers[0].Address(), 0);
         return;
@@ -284,8 +767,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
+    TracePass(liverpool->DrawRegs());
 
     if (!FilterDraw()) {
+        return;
+    }
+    if (SkipStaggeredShadow(liverpool->DrawRegs()) || ReuseShadowCascade()) {
         return;
     }
 
@@ -314,8 +801,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         SotcStats::Drop(0, liverpool->DrawRegs().color_buffers[0].Address(), 1);
         return;
     }
+    TraceShadowShaders(liverpool->DrawRegs(), pipeline);
 
     PrepareRenderState(pipeline);
+    if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of frame generation
+        Dlssg::NoteDraw(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
+                        cb_descs[4].first, texture_cache);
+    }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, liverpool->DrawRegs().color_buffers[0].Address(), 1);
         return;
@@ -852,10 +1344,13 @@ void Rasterizer::FlushPeriodic() {
             return 256u;
         }
         // SotC: +20% fps in the open world (14-15 -> 18). Other games keep the upstream behavior.
-        // Only measured on NVIDIA; Pink-shadPS4 advises turning it off on AMD (black screen).
+        // Pink-shadPS4 advises turning it off on AMD (black screen); with readbacks ahead on a
+        // Radeon RX 6650 XT the image is right and the sanctuary goes from 17.4 to 22.4 fps.
         constexpr u32 VendorNvidia = 0x10DE;
+        constexpr u32 VendorAmd = 0x1002;
         return Common::ElfInfo::Instance().GameSerial() == "CUSA08809" &&
-                       instance.GetVendorID() == VendorNvidia
+                       (instance.GetVendorID() == VendorNvidia ||
+                        instance.GetVendorID() == VendorAmd)
                    ? 256u
                    : 0u;
     }();

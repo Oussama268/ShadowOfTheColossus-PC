@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.57-opt8
+# Shadow of the Colossus — PC (port nativo / native port) · v0.59
 
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -21,6 +21,9 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.59** | **Mais FPS** (fork do Oussama268: thread de desenhos, shaders traduzidos em paralelo; ponte 30 → 37–40 FPS), **correção para a queda no final do jogo e ao carregar saves** (em teste: conte nas issues), **F11 tela cheia**, opções de **uso de memória de vídeo** e **volume**, **atualização automática** no lançador, ultrawide com o modo PS4 Pro, correções para placas de 6 GB e Windows em chinês. |
+| **0.58.1** | **Texturas em alta qualidade** (folhas e pedras nítidas; o jogo não carregava as versões de alta resolução desde a 0.0.13) e **ícone próprio da janela do jogo** (ou o do jogo, ou uma imagem sua). |
+| **0.58** | **Versão da comunidade** (Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy, tabnul): **menos quedas** (falta de memória de vídeo, jogo congelando, queda pós-colosso no modo PS4 Pro), **+15% de FPS** e menos memória de vídeo, correções AMD (bloco preto RDNA3/4), **widescreen 21:9/32:9**, **FPS 30/60/ilimitado**, **ícones Xbox**, geração de quadros FSR 3 / DLSS-G (experimental), lançador em espanhol, chinês, coreano e russo. |
 | **0.57-opt8** | **Sem tela preta depois de atualizar o driver** (98 s → 0,4 s). **Telas widescreen e ultrawide** 16:10, 21:9 e 32:9 sem esticar (código de tabnul; #58, #42). **Opção "FPS livre"** ao lado do 60 FPS limitado. **AMD:** fim das listras nas sombras e na água (#57, #28). **Windows:** travamento raro corrigido e uma thread que girava à toa (código de jownatan). **Intel (#59):** correções parciais, a Iris Xe ainda trava. O registro mostra a placa e o driver. Desempenho igual à opt7. O cache de shaders é refeito em AMD e Intel. |
 | **0.57-opt7** | **Bem menos travadas na primeira vez que se joga:** shaders novos traduzidos em várias threads (caches vazios, demo: pior travada 4,6–5,2 s → 3,4–3,9 s, 1% low 29 → 39 FPS; santuário 6,0 → 3,9 s). **Modo 60 FPS limitado a 60** (relatos do 5º colosso, #34, e da cena do 2º colosso, #48). **Correções:** Windows em chinês (#45), mensagem para jogo criptografado (#52). O cache de shaders não é refeito. |
 | **0.57-opt6** | **Mais FPS com uma thread só para desenhar** (ideia e código de Lucas-blip-png): santuário 34,7 → 38,2 FPS, trecho pesado do mundo aberto 34,0 → 36,1 FPS. **Primeira visita a uma área:** pipelines de compute montados em várias threads (cache vazio: pior travada 22 s → 6 s). **Correção** do fechamento ao carregar o save no modo PS4 Pro (#35). **Atualização pelo lançador** (#37). O cache de shaders é refeito na primeira abertura. |
@@ -40,8 +43,12 @@ Detalhes de cada versão no [CHANGELOG](CHANGELOG.md).
 
 - Na primeira abertura depois de atualizar, os shaders são compilados de novo: o primeiro
   carregamento demora e engasga.
-- Placas **AMD**: a 0.57 traz a correção das cores verdes/rosas ([#7](../../issues/7)), ainda sem
-  teste numa AMD. Se continuar, mande o seu `user/last_run.log` na issue.
+- Placas **AMD**: as correções da 0.57 e da 0.58 ainda não foram testadas aqui numa AMD. Se algo
+  continuar errado, mande o seu `user/last_run.log` na issue.
+- **Geração de quadros** (experimental): a barra de vida/stamina pode tremer, e ela só faz
+  diferença com o FPS em 30.
+- **60 FPS / ilimitado:** sem o limite de 30 do jogo, algumas cenas se comportam diferente (a
+  parede do 2º colosso, colossos "voando"); para essas partes use 30 FPS.
 - Com 8 GB de memória de vídeo, o uso fica perto do limite em áreas grandes.
 
 ### Download e uso
@@ -124,6 +131,9 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.59** | **More FPS** (Oussama268's fork: draw thread, shaders translated in parallel; bridge 30 → 37–40 FPS), **fix for the ending and save-load crash** (still being tested: report in the issues), **F11 fullscreen**, **video memory use** and **volume** options, launcher **self-update**, ultrawide with PS4 Pro mode, fixes for 6 GB cards and Chinese Windows. |
+| **0.58.1** | **High quality textures** (sharp leaves and rocks; the game had not streamed its high resolution versions since 0.0.13) and the **game window's own icon** (or the game's, or a picture of yours). |
+| **0.58** | **Community release** (Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy, tabnul): **fewer crashes** (out of video memory, game freezing, post-colossus crash in PS4 Pro mode), **+15% FPS** and less video memory, AMD fixes (RDNA3/4 black tiles), **21:9/32:9 widescreen**, **FPS 30/60/unlimited**, **Xbox button icons**, FSR 3 / DLSS-G frame generation (experimental), launcher in Spanish, Chinese, Korean and Russian. |
 | **0.57-opt8** | **No black screen after a driver update** (98 s → 0.4 s). **Widescreen and ultrawide** 16:10, 21:9 and 32:9 without stretching (code by tabnul; #58, #42). **"Unlocked FPS" option** next to the capped 60 FPS. **AMD:** no more stripes over shadows and water (#57, #28). **Windows:** a rare freeze fixed and a thread that spun for nothing (code by jownatan). **Intel (#59):** partial fixes, Iris Xe still freezes. The log shows the GPU and driver. Performance same as opt7. The shader cache is rebuilt on AMD and Intel. |
 | **0.57-opt7** | **Far fewer freezes the first time you play:** new shaders translated on several threads (empty caches, demo: worst freeze 4.6–5.2 s → 3.4–3.9 s, 1% low 29 → 39 FPS; shrine 6.0 → 3.9 s). **60 FPS mode capped at 60** (reports of the 5th colossus, #34, and the 2nd colossus cutscene, #48). **Fixes:** Chinese Windows (#45), message for an encrypted game (#52). The shader cache is kept. |
 | **0.57-opt6** | **More FPS with a thread of its own for drawing** (idea and code by Lucas-blip-png): shrine 34.7 → 38.2 FPS, heavy open-world stretch 34.0 → 36.1 FPS. **First visit to an area:** compute pipelines built on several threads (empty cache: worst freeze 22 s → 6 s). **Fix** for the crash when loading a save in PS4 Pro mode (#35). **Updates from the launcher** (#37). The shader cache is rebuilt on first launch. |
@@ -142,8 +152,12 @@ Full details in the [CHANGELOG](CHANGELOG.md) (in Portuguese).
 ### Known issues
 
 - The first start after updating rebuilds the shaders: the first load is slow and stutters.
-- **AMD** GPUs: 0.57 has the fix for the green/pink tint ([#7](../../issues/7)), not yet tested
-  on an AMD card. If it persists, attach your `user/last_run.log` to the issue.
+- **AMD** GPUs: the 0.57 and 0.58 fixes are not yet tested here on an AMD card. If something is
+  still wrong, attach your `user/last_run.log` to the issue.
+- **Frame generation** (experimental): the health/stamina bars may shake, and it only matters at
+  30 FPS.
+- **60 FPS / unlimited:** without the game's 30 FPS cap some scenes behave differently (the 2nd
+  colossus' wall, colossi "flying"); use 30 FPS there.
 - With 8 GB of video memory, usage gets close to the limit in large areas.
 
 ### Download and use
