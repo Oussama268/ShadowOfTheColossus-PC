@@ -31,6 +31,10 @@ bool Visible();
 /// Present thread: draws into `view` (layout ColorAttachmentOptimal).
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
 
+/// Any thread, every frame: the upscaler label in the top right corner (a static string;
+/// nullptr: none).
+void SetUpscalerLabel(const char* label);
+
 /// A text entry or the save list is shown: the game's input is held neutral.
 bool CapturesInput();
 

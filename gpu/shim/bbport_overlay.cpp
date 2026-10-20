@@ -147,7 +147,29 @@ void SaveListBox() {
     ImGui::End();
 }
 
-void FpsCounter() {
+std::atomic<const char*> upscaler_label{nullptr};
+
+void UpscalerLabel(const char* label) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 12.0f * base_scale;
+    // Top right, below the FPS counter when that is shown.
+    float y = viewport->WorkPos.y + pad;
+    if (BbSettings::Get().show_fps) {
+        y += ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().WindowPadding.y * 2.0f +
+             pad * 0.5f;
+    }
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad, y),
+                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.5f);
+    ImGui::Begin("##upscaler", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::Text("%s  (F9)", label);
+    ImGui::End();
+}
+
+float FpsCounter() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float pad = 12.0f * base_scale;
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad,
@@ -353,7 +375,12 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (text_entry_active || list_active || BbSettings::Get().show_fps);
+    return initialized && (text_entry_active || list_active || BbSettings::Get().show_fps ||
+                           upscaler_label.load(std::memory_order_relaxed));
+}
+
+void SetUpscalerLabel(const char* label) {
+    upscaler_label.store(label, std::memory_order_relaxed);
 }
 
 bool CapturesInput() {
@@ -433,6 +460,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     ImGui::NewFrame();
     if (BbSettings::Get().show_fps) {
         FpsCounter();
+    }
+    if (const char* label = upscaler_label.load(std::memory_order_relaxed)) {
+        UpscalerLabel(label);
     }
     if (text_entry_active) {
         TextEntryBox();

@@ -77,7 +77,7 @@ normalmente, a 30 FPS.
   opções rápidas de saída, upscaler, 60 FPS, filtro 16x e tela cheia.
 - **Jogo e saves:** biblioteca de jogos, busca automática no PC, importação de saves do shadPS4.
 - **Imagem e FPS:** saída 720p a 4K, também 16:10, 21:9 e 32:9 (o jogo renderiza no tamanho da saída, até 1080 linhas
-  de altura, e o FSR 1 + RCAS amplia o resto),
+  de altura, e o FSR 1 + RCAS amplia o resto), NVIDIA DLSS em placas RTX (Qualidade, Equilibrado, Desempenho),
   modo PS4 Pro (o jogo oferece Cinematográfico/Desempenho no próprio menu), efeitos (vinheta,
   névoa, SSAO) e opções de desempenho.
 - **Controles:** controle (DualShock 4, DualSense, Xbox) automático; câmera no mouse;
@@ -171,7 +171,7 @@ The patch modes (60 FPS, 16x filtering) only apply to EU 1.01; other versions ru
 ### Launcher features
 
 Game library and automatic search, shadPS4 save import, 720p–4K output (the game renders at
-1080p, upscaled with FSR 1 + RCAS), PS4 Pro mode, 60 FPS and 16x AF modes, controller support
+1080p, upscaled with FSR 1 + RCAS, or NVIDIA DLSS Quality/Balanced/Performance on RTX cards), PS4 Pro mode, 60 FPS and 16x AF modes, controller support
 (DualShock 4, DualSense, Xbox) with mouse camera, key remapping, Bluepoint engine cvars, desktop
 shortcut and a session log in `user/last_run.log`.
 

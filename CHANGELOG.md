@@ -1,5 +1,15 @@
 # Changelog
 
+## Próxima versão
+- **NVIDIA DLSS (placas RTX)** como upscaler, na página **Imagem e FPS**: o jogo renderiza menor
+  e o DLSS amplia com detalhe reconstruído dos quadros anteriores. Modos Qualidade (1,5×),
+  Equilibrado (1,72×) e Desempenho (2×), nitidez da cena, do texto e do céu. O TAA do jogo fica
+  desligado (o DLSS faz o anti-aliasing), a vinheta é aplicada depois do DLSS e o texto/HUD é
+  ampliado à parte, por cima da cena. Sem placa RTX ou sem os arquivos da NVIDIA (incluídos no
+  pacote), o FSR 1 amplia a mesma imagem. Opção de diagnóstico: **F9** troca entre DLSS e FSR 1
+  no jogo. Limite conhecido: o texto é desenhado no tamanho renderizado, então fica menos nítido
+  e com bordas mais duras no modo Desempenho; "Nitidez do texto" em Média ajuda.
+
 ## 0.57-opt8 — 2026-10-20 (fork Oussama268)
 - **Sem tela preta depois de atualizar o driver de vídeo:** com o cache do driver vazio, o port
   montava todos os pipelines guardados um por um antes de mostrar o jogo (98 s de janela preta,

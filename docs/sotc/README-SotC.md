@@ -45,6 +45,10 @@ Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **
 - **Saída** 720p, 1080p, 1440p ou 4K. O jogo renderiza em 1080p, como no PS4, e a imagem é
   ampliada para a saída com **FSR 1** + nitidez (RCAS) ou bilinear. A janela nunca passa de 90%
   da tela; a tela cheia usa o monitor inteiro.
+- **NVIDIA DLSS** (placas RTX): o jogo renderiza menor (Qualidade 1,5×, Equilibrado 1,72×,
+  Desempenho 2×) e o DLSS amplia com detalhe dos quadros anteriores. O texto é desenhado no
+  tamanho renderizado: no modo Desempenho, "Nitidez do texto" em Média deixa as bordas mais suaves.
+  Sem placa RTX, o FSR 1 amplia.
 - **60 FPS** (experimental): tira o limite de 30 FPS do jogo (patch GoldHEN de illusion), com
   vblank a 120 Hz. Mediu 38 FPS no campo aberto e ~25 no templo.
 - **Texturas nítidas**: filtro anisotrópico 16x, quase sem custo.

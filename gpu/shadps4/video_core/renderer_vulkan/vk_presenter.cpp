@@ -15,6 +15,8 @@
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -476,8 +478,11 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     const vk::Device device = instance.GetDevice();
 
     // Create presentation frames.
-    present_frames.resize(num_images);
-    for (u32 i = 0; i < num_images; i++) {
+    // sotc: with DLSS Frame Generation Streamline keeps 2 swapchain images; 4 frames in flight
+    // so that the command processor does not wait for the presenter.
+    const u32 num_frames = Dlssg::Enabled() ? std::max(num_images, 4u) : num_images;
+    present_frames.resize(num_frames);
+    for (u32 i = 0; i < num_frames; i++) {
         Frame& frame = present_frames[i];
         frame.id = i;
         auto fence = Check<"create present done fence">(
@@ -636,6 +641,7 @@ Frame* Presenter::PrepareLastFrame() {
     frame->ready_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
+    Dlssg::NoInputs(frame->id); // sotc: a repeated frame, no frame generation
     return frame;
 }
 
@@ -698,6 +704,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto& image = texture_cache.GetImage(image_id);
     auto image_view = *image.FindView(view_info).image_view;
     const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
+    // sotc: this frame's depth, motion vectors and camera for DLSS Frame Generation.
+    Dlssg::PrepareInputs(frame->id, cmdbuf, texture_cache, runtime, image_size.width,
+                         image_size.height);
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
     // sotc: SOTC_OUTPUT_RES=WxH (1280x720 ... 3840x2160): the presented frame has this size, the
     // game's 1080p image is scaled to it (FSR 1 + RCAS with BB_FSR1=1, else bilinear).
@@ -748,18 +757,61 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
-    runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
-                    vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
-    runtime.FlushBarriers();
+    // sotc: DLSS super resolution (SOTC_UPSCALER=dlss): the game's scene before its UI, upscaled
+    // to the frame's size; the post process pass puts the UI layer back over it. Frames without
+    // that scene (menus, loading screens) are presented as before.
+    const auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
+                                         frame->width, frame->height);
+    if (Dlssg::SuperResolutionAvailable() && Dlssg::CompareMode()) {
+        BbOverlay::SetUpscalerLabel(upscaled.scene     ? Dlssg::ModeName()
+                                    : fsr_settings.enable ? "FSR1"
+                                                          : "Bilinear");
+    }
+    if (upscaled.scene) {
+        // DLSS has no sharpening of its own: full-strength RCAS (needed to match FSR1 detail),
+        // unless SOTC_DLSS_SHARPEN (attenuation in stops, 0 = sharpest) or "off" says otherwise.
+        // SOTC_DLSS_UI_SHARPEN and SOTC_DLSS_SKY_SHARPEN: unsharp amounts of the upscaled UI
+        // and of the sky (0 = none).
+        static const auto env = [](const char* name, float fallback) {
+            const char* v = std::getenv(name);
+            if (!v || !*v) {
+                return fallback;
+            }
+            return v[0] == 'o' ? -1.0f : static_cast<float>(std::atof(v));
+        };
+        static const float sharpness = env("SOTC_DLSS_SHARPEN", 0.0f);
+        static const float ui_sharpen = std::max(env("SOTC_DLSS_UI_SHARPEN", 3.0f), 0.0f);
+        static const float sky_sharpen = std::max(env("SOTC_DLSS_SKY_SHARPEN", 2.0f), 0.0f);
+        vk::ImageView scene = upscaled.scene;
+        if (sharpness >= 0.0f) {
+            scene = fsr_pass.Sharpen(cmdbuf, scene, {frame->width, frame->height}, sharpness);
+        }
+        pp_settings.srgb_input = 0;
+        pp_settings.ui = 1;
+        if (!Dlssg::Vignette(pp_settings.vignette.data())) {
+            pp_settings.vignette = {};
+        }
+        pp_settings.ui_sharpen = ui_sharpen;
+        pp_settings.sky_sharpen = sky_sharpen;
+        pp_pass.Render(cmdbuf, scene, {frame->width, frame->height}, *frame, pp_settings,
+                       upscaled.ui, upscaled.sky);
+    } else {
+        runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eFragmentShader,
+                        vk::AccessFlagBits2::eShaderRead);
+        runtime.FlushBarriers();
 
-    image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
-                                 fsr_settings, frame->is_hdr);
+        image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
+                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr);
 
-    // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
-    // the post process pass still sRGB encoded and has to be decoded there instead.
-    pp_settings.srgb_input =
-        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+        // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
+        // the post process pass still sRGB encoded and has to be decoded there instead.
+        pp_settings.srgb_input =
+            attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+        pp_settings.ui = 0;
+        pp_settings.vignette = {};
+        pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    }
 
 
     if (pending_screenshot) {
@@ -774,6 +826,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+    Dlssg::FrameSubmitted(frame->id);
     return frame;
 }
 
@@ -847,6 +900,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     frame->ready_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
+    Dlssg::NoInputs(frame->id); // sotc: no game image, no frame generation
     return frame;
 }
 
@@ -863,10 +917,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     // Recreate the swapchain if the window was resized.
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
+        Dlssg::Suspend(); // sotc: frame generation off while the swapchain changes
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
     if (!swapchain.AcquireNextImage()) {
+        Dlssg::Suspend();
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
@@ -1119,8 +1175,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     // Present to swapchain.
     {
+        // sotc: DLSS Frame Generation inputs of this frame, and Reflex present markers.
+        const vk::Extent2D extent = swapchain.GetExtent();
+        Dlssg::BeforePresent(frame->id,
+                             FitImage(frame->width, frame->height, extent.width, extent.height),
+                             extent);
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        const bool presented = swapchain.Present();
+        Dlssg::AfterPresent(frame->id);
+        if (!presented) {
+            Dlssg::Suspend();
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }

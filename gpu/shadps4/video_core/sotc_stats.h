@@ -177,6 +177,12 @@ inline constexpr const char* kFrameCauseNames[FrameCauses] = {
 inline std::atomic<uint64_t> frame_copy_bytes{0};
 inline std::atomic<uint64_t> frame_ns[FrameCauses]{};
 inline std::atomic<uint64_t> frame_compiles{0}; ///< shader modules and pipelines created
+inline std::atomic<uint64_t> flip_count{0}; ///< game flips (videoout/driver.cpp Flip)
+/// DLSS (vk_dlssg.cpp): -1 not loaded, 0 off, 1 on, 2 error; frames shown per game frame;
+/// sl::DLSSGStatus bits.
+inline std::atomic<int> ov_fg_state{-1};
+inline std::atomic<uint32_t> ov_fg_frames{0};
+inline std::atomic<uint32_t> ov_fg_status{0};
 /// Phases of PipelineCache::CompileModule (SOTC_FPS, "SOTC COMPILE" line): translate, emit SPIR-V,
 /// shader patch lookup, vkCreateShaderModule, cache registration.
 inline std::atomic<uint64_t> compile_phase_ns[5]{};
