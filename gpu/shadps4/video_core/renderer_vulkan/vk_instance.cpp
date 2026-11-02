@@ -21,6 +21,10 @@
 
 #include <vk_mem_alloc.h>
 
+namespace VideoCore {
+void ImageFreeDrain(); // texture_cache/image.cpp
+}
+
 namespace Vulkan {
 
 namespace {
@@ -230,6 +234,7 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 
 Instance::~Instance() {
     ImGui::Core::Shutdown(GetDevice());
+    VideoCore::ImageFreeDrain(); // sotc: no image destroy may run past the allocator
     vmaDestroyAllocator(allocator);
 }
 

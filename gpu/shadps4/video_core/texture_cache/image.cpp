@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <condition_variable>
 #include <mutex>
+#include <thread>
+#include <tuple>
 #include <optional>
 #include <cstdlib>
 #include <vector>
@@ -13,6 +16,7 @@
 #include <ranges>
 #include <unordered_map>
 #include "common/assert.h"
+#include "common/thread.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -98,13 +102,80 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
     return feature_flags;
 }
 
+// sotc: SOTC_IMAGE_FREE_ASYNC (default on, =0 off). Images are destroyed by deferred operations,
+// once the GPU is done with them, but on the draw thread, and freeing a dedicated allocation is a
+// kernel call on Windows (D3DKMTDestroyAllocation2): with the creates, ~5% of the draw thread in
+// frames over 45 ms of the attract demo, when the camera cuts to a new area and textures are
+// replaced (ResolveOverlap, ExpandImage). The vmaDestroyImage moves to this thread; the views
+// were destroyed before, and the allocator is internally synchronized.
+namespace {
+struct ImageFreer {
+    std::mutex mutex;
+    std::condition_variable cv, idle_cv;
+    std::vector<std::tuple<VmaAllocator, VkImage, VmaAllocation>> queue;
+    bool busy = false;
+
+    ImageFreer() {
+        std::thread{[this] {
+            Common::SetCurrentThreadName("shadPS4:ImageFree");
+            std::unique_lock lk{mutex};
+            for (;;) {
+                cv.wait(lk, [&] { return !queue.empty(); });
+                auto batch = std::move(queue);
+                queue.clear();
+                busy = true;
+                lk.unlock();
+                for (const auto& [allocator, image, allocation] : batch) {
+                    vmaDestroyImage(allocator, image, allocation);
+                }
+                lk.lock();
+                busy = false;
+                idle_cv.notify_all();
+            }
+        }}.detach();
+    }
+    void Push(VmaAllocator allocator, VkImage image, VmaAllocation allocation) {
+        {
+            std::scoped_lock lk{mutex};
+            queue.emplace_back(allocator, image, allocation);
+        }
+        cv.notify_one();
+    }
+    void Drain() {
+        std::unique_lock lk{mutex};
+        idle_cv.wait(lk, [&] { return queue.empty() && !busy; });
+    }
+};
+bool ImageFreeAsync() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_IMAGE_FREE_ASYNC");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+ImageFreer& Freer() {
+    static ImageFreer* freer = new ImageFreer; // never destroyed: the thread outlives statics
+    return *freer;
+}
+} // namespace
+
+void ImageFreeDrain() {
+    if (ImageFreeAsync()) {
+        Freer().Drain();
+    }
+}
+
 UniqueImage::~UniqueImage() {
     Destroy();
 }
 
 void UniqueImage::Destroy() {
     if (image) {
-        vmaDestroyImage(allocator, image, allocation);
+        if (ImageFreeAsync()) {
+            Freer().Push(allocator, static_cast<VkImage>(image), allocation);
+        } else {
+            vmaDestroyImage(allocator, image, allocation);
+        }
         image = vk::Image{};
         allocation = {};
         SotcStats::image_bytes.fetch_sub(size_bytes, std::memory_order_relaxed);
@@ -131,6 +202,12 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     const SotcStats::ScopedTimer alloc_timer{SotcStats::image_alloc_ns};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        // sotc: memory of images freed just before may still be on the free thread.
+        ImageFreeDrain();
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                                &allocation, &alloc_info);
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
         // Over the video memory budget (loading screens peak before the cache collects old
         // images). Going over budget lets the driver page memory out instead of aborting.

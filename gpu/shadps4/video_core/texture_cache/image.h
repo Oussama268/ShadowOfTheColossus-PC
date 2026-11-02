@@ -38,6 +38,9 @@ enum ImageFlagBits : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
+/// sotc: waits until images handed to the free thread are destroyed (SOTC_IMAGE_FREE_ASYNC).
+void ImageFreeDrain();
+
 struct UniqueImage {
     explicit UniqueImage() = default;
     explicit UniqueImage(vk::Device device, VmaAllocator allocator)
