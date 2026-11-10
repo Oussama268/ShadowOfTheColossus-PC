@@ -87,6 +87,7 @@ int runtime_ngs2_native(void);
 void *runtime_ngs2_function(const char *symbol);
 int runtime_thread_is_guest(void);
 uintptr_t runtime_fiber_resolve(const char *name);
+void runtime_fiber_thread_exit(void);
 void runtime_fiber_report(void);
 void runtime_pad_report(void);
 uintptr_t runtime_rtc_resolve(const char *name);
