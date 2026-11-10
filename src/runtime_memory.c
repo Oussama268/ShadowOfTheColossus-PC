@@ -1914,6 +1914,12 @@ static int mapped_length_fast(uintptr_t address, uint64_t size, uint64_t *length
     *length=n<size ? n : size;
     return 1;
 }
+/* sotc: 0.73: our lock-free gap check (SOTC_CLAMP_GAP, 0.72.2) is replaced by Oussama268's
+ * mapped_length_fast (SOTC_CLAMP_FAST), which covers the same case; the counter stays at 0. */
+static uint64_t clamp_gap_hits;
+uint64_t runtime_memory_clamp_gap_hits(void) {
+    return __atomic_exchange_n(&clamp_gap_hits,0,__ATOMIC_RELAXED);
+}
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
     uint64_t fast;
     if (size && mapped_length_fast(address,size,&fast)) return fast;

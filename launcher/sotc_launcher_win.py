@@ -48,7 +48,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.72.1-opt13'
+VERSION = '0.73'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -169,7 +169,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'textures': 'high', 'hdr': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'textures': 'high', 'hdr': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'fps_dynamic': True, 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': True, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
@@ -188,6 +188,8 @@ DEFAULT_UPGRADES = [
     # blur); straight to the game.
     ('0.71', {'fg_hudless': True, 'fx_motionblur': False, 'skip_logos': True}),
     # Fast GPU readbacks; the grass back as on PS4 (the play modes no longer change it).
+    # Dynamic FPS in the 60 FPS mode (a steady step below 60 when the game cannot keep it).
+    ('0.73', {'fps_dynamic': True}),
     ('0.72', {'rb_hot': True, 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1',
               'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1'}),
 ]
@@ -643,6 +645,32 @@ def _shortcut_script(play, frozen, executable, port_dir, game_icon):
             + (f'$s.Arguments={_ps_quote(arguments)};' if arguments else '') + '$s.Save()')
 
 
+def clear_shader_cache_after_update(settings):
+    """sotc: 0.72.2: a port update clears the shader cache once. Shaders and pipelines built by the
+    previous port can conflict with the new one (wrong or missing effects, crashes when one is
+    loaded); the game builds them again, with some stutter at the start. The port version that
+    built the cache is kept next to it (user/cache/port_version.txt; the --play path never saves
+    the settings, so they cannot hold it)."""
+    data = user_dir(settings)
+    marker = data / 'cache' / 'port_version.txt'
+    try:
+        built_by = marker.read_text(encoding='utf-8').strip()
+    except OSError:
+        built_by = ''
+    if built_by == VERSION:
+        return
+    # A first start (no cache yet) has nothing to clear; an older cache without the marker was
+    # built by a port before 0.72.2.
+    if (data / 'cache').exists() or (data / 'shader').exists():
+        for name in ('cache', 'shader'):
+            shutil.rmtree(data / name, ignore_errors=True)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(VERSION + '\n', encoding='utf-8')
+    except OSError:
+        pass
+
+
 def load_settings():
     """Saved settings over the defaults. Older settings that turned DLSS-G on with SOTC_DLSSG=1 in
     the extra variables get the frame generation setting instead."""
@@ -675,6 +703,7 @@ def load_settings():
             if before < sotc_update.version_key(version):
                 settings.update(values)
     settings['settings_version'] = VERSION
+    clear_shader_cache_after_update(settings)
     if 'framegen' not in saved:
         extra = str(settings.get('extra_env', '')).split()
         if 'SOTC_DLSSG=1' in extra:
@@ -741,11 +770,30 @@ def monitors():
             for device, w, h, centre, primary in found]
 
 
+def screen_refresh_hz():
+    """The primary screen's refresh rate (60 when unknown)."""
+    class DEVMODEW(ctypes.Structure):
+        _fields_ = [('name', ctypes.c_wchar * 32), ('spec', ctypes.c_ushort), ('driver', ctypes.c_ushort),
+                    ('size', ctypes.c_ushort), ('extra', ctypes.c_ushort), ('fields', ctypes.c_ulong),
+                    ('pos', ctypes.c_byte * 16), ('color', ctypes.c_short * 5), ('form', ctypes.c_wchar * 32),
+                    ('logpixels', ctypes.c_ushort), ('bpp', ctypes.c_ulong), ('width', ctypes.c_ulong),
+                    ('height', ctypes.c_ulong), ('flags', ctypes.c_ulong), ('hz', ctypes.c_ulong)]
+    try:
+        mode = DEVMODEW()
+        mode.size = ctypes.sizeof(DEVMODEW)
+        if ctypes.windll.user32.EnumDisplaySettingsW(None, -1, ctypes.byref(mode)) and mode.hz > 1:
+            return int(mode.hz)
+    except (AttributeError, OSError):
+        pass
+    return 60
+
+
 def game_environment(s):
     env = dict(os.environ)
     info = game_info(s['game_dir'])
     if info and info[1] != '?':
         env['SOTC_GAME_VERSION'] = info[1]  # window title (with the frame rate)
+    env['SOTC_PORT_VERSION'] = VERSION  # sotc: window title
     icon = window_icon_file(s)
     if icon:
         env['SOTC_WINDOW_ICON'] = str(icon)
@@ -771,6 +819,13 @@ def game_environment(s):
     env['SOTC_MODES'] = ','.join(modes)
     env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
+    # sotc: 0.73 dynamic FPS (videoout driver.cpp, SOTC_FPS_DYNAMIC): with the 60 FPS limit, frames
+    # that cannot keep 60 lower it to a step that divides the screen's refresh (48 at 144 Hz, 40 at
+    # 120/240 Hz, 30 at 60 Hz), steady instead of swinging; it tries 60 again every 10 s.
+    if fps_mode == '60' and s.get('fps_dynamic', True):
+        hz = screen_refresh_hz()
+        step = 48 if hz % 48 == 0 else 40 if hz % 40 == 0 else 45 if hz % 45 == 0 else 30
+        env.setdefault('SOTC_FPS_DYNAMIC', str(step))
     env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     # The monitor the game window opens on (window.cpp): the centre of the chosen one, found again now
@@ -852,26 +907,43 @@ def game_environment(s):
         # the measured mips, finer mips (High 1, Maximum 0, both were 2) and, on Maximum, banks
         # kept sampled for 3 s (they had exhausted the pool, 0x1a371).
         env.setdefault('SOTC_LOD_FEEDBACK', '1')
-        # Light video memory profile (cards under 8 GB): Maximum at mip 1 without the 3 s, High at
-        # mip 2 as in 0.71.
+        # sotc: 0.72.2 had put both qualities back at mip 2: the finer mips with Maximum's 3 s
+        # linger and no page pool switch copied up to 1.1 GB of textures in a frame at the forest
+        # entrance (5 Nov). That left Maximum (the Extreme mode) blurry. Now the finer mips are
+        # back (High 1, Maximum 0, light profile Maximum 1 / High 2), without the 3 s linger and
+        # with the pool switch: the copies go through the GPU (SOTC_TEX_DIRECT) and the area
+        # change fixes since then (T48). SOTC_LOD_LEVEL / _LINGER / _POOL_LOW still override.
         if light:
             env.setdefault('SOTC_LOD_LEVEL', '1' if textures == 'max' else '2')
         else:
             env.setdefault('SOTC_LOD_LEVEL', '0' if textures == 'max' else '1')
-        if textures == 'max' and not light:
-            env['SOTC_LOD_LINGER'] = env.get('SOTC_LOD_LINGER') if env.get('SOTC_LOD_LINGER') != '1' else '180'
-    # sotc: the heap guard's two shortcuts, off since 0.70 for the 0x49800 crash, which came from
-    # the same double free: on again (tested with the above).
-    env.setdefault('SOTC_GUARD_STALE', '1')
-    env.setdefault('SOTC_GUARD_USER_POINTER', '1')
+    # sotc: the heap guard's two shortcuts (SOTC_GUARD_STALE, SOTC_GUARD_USER_POINTER) stay off
+    # again (0.73): on since 0.72, they spoilt the game's heap at the ending (objects found cleared
+    # at 0x144c60 / 0x14cce7 / 0x564d24, the allocator at 0x499cc, 9 Nov), as T49 had suspected for
+    # 0x49800; with them off the ending and the intro skip went through with nothing to repair.
+    # sotc: 0.72.2 (T51): at the end of the game the game returns page pool pages under textures
+    # it goes on drawing; a refresh then uploaded another texture's bytes into them (stretched
+    # textures, flicker, the close between the ending and the intro). Two clean ending runs.
+    env.setdefault('SOTC_POOL_FREEZE', '1')
+    # sotc: 0.72.2 (T48): an unmap's arena release waited for all the GPU work, 28-63 times a
+    # frame at area changes (10-20 ms a frame); now once the GPU passed the unmap.
+    env.setdefault('SOTC_RELEASE_DEFER', '1')
+    # sotc: 0.72.2: images of 2048x2048 and more get memory of their own: the shared 64 MiB
+    # blocks kept up to 1.8 GB free after an area's textures went (over the budget on 8 GB cards).
+    env.setdefault('SOTC_IMAGE_DEDICATED', '1')
+    # sotc: 0.72.2 (T48): new textures read by the GPU in the game's memory (no CPU copy at the
+    # first entry of an area; forest 14 -> 9-10 slow frames). The game's 10 GB are imported at
+    # boot (~2.6 s) and stay pinned in RAM: only with 24 GB or more.
+    if (sotc_hardware.memory_gb() or 0) >= 24:
+        env.setdefault('SOTC_PC_MEMORY', '1')
+        env.setdefault('SOTC_PC_MEMORY_PREIMPORT', '1')
+        env.setdefault('SOTC_TEX_DIRECT', '1')
     # sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
     # (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288, sotc_modes.py POOL_FIX): an
     # hour without a crash with it (26 Oct). Experimental there; SOTC_MAX_IN_PRO=0 brings back High.
     if 'SOTC_MAX_IN_PRO=0' in str(s.get('extra_env', '')) and textures == 'max' and env['SOTC_NEO'] == '1':
         textures = 'high'
         env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
-    if textures == 'max' and not light:  # sotc: without the page pool switch (sotc_lod_stats.h)
-        env.setdefault('SOTC_LOD_POOL_LOW', '0')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
     env['SOTC_UI_LANG'] = s.get('ui_language') or windows_language()  # overlay and F7/F8 texts
@@ -1474,6 +1546,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.row(quick, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(quick, 'sharpness', SHARPNESS, 24))
         self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
+        self.check(quick, 'fps_dynamic', _('FPS dinâmico (no modo 60)', 'Dynamic FPS (60 FPS mode)'),
+                   _('Quando o jogo não segura 60, trava num degrau estável que combina com a tela (48 em 144 Hz, '
+                     '40 em 120 Hz, 30 em 60 Hz) em vez de oscilar, e volta a 60 quando sobra folga.',
+                     'When the game cannot keep 60 it locks to a steady step that suits the screen (48 at '
+                     '144 Hz, 40 at 120 Hz, 30 at 60 Hz) instead of swinging, and goes back to 60 when it can.'))
         self.row(quick, _('Texturas', 'Textures'), self.choice(quick, 'textures', TEXTURES, 24))
         self.row(quick, _('Memória da placa', 'Card memory'), self.choice(quick, 'vram_profile', VRAM_PROFILES, 24))
         self.vram_profile_hint = ttk.Label(quick, text='', style='Muted.TLabel', wraplength=self.px(300),
@@ -1511,11 +1588,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                 else _('placa ainda não verificada', 'card not checked yet'))
         current = dict(self.app, vram_profile=self.var('vram_profile').get())
         if light_vram(current):
-            text = _('Leve ({}): Máxima no mip 1, Alta no mip 2, memória de vídeo no máximo Padrão.',
-                     'Light ({}): Maximum at mip 1, High at mip 2, video memory at most Default.').format(card)
+            text = _('Leve ({}): uso de memória de vídeo no máximo Padrão, sem reserva de envio nela.',
+                     'Light ({}): video memory use at most Default, no upload reserve in it.').format(card)
         else:
-            text = _('Completo ({}): Máxima no mip 0 e todas as melhorias de textura.',
-                     'Full ({}): Maximum at mip 0 and every texture improvement.').format(card)
+            text = _('Completo ({}): uso de memória de vídeo como escolhido.',
+                     'Full ({}): video memory use as chosen.').format(card)
         self.vram_profile_hint.configure(text=text)
 
     def show_play_mode_hint(self):

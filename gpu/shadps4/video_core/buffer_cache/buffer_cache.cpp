@@ -28,6 +28,7 @@ extern "C" uintptr_t runtime_sotc_heap_table(void);
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/sotc_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -145,6 +146,7 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::TickFrame() {
+    ProcessPendingReleases(); // sotc: SOTC_RELEASE_DEFER
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
@@ -443,6 +445,7 @@ void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
 }
 
 void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
+    const SotcStats::SplitTimer begin_split{SotcStats::SplitRbBegin};
     SotcStats::readbacks.fetch_add(1, std::memory_order_relaxed);
     NoteHotRead(readback.device_addr, readback.size);
     const u32 first_block = readback.device_addr >> block_shift;
@@ -499,7 +502,10 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
         }
         readback.data_ready = last_write < readback.tick && scheduler.IsFree(last_write);
     }
-    scheduler.Flush();
+    {
+        const SotcStats::SplitTimer flush_split{SotcStats::SplitRbBeginFlush};
+        scheduler.Flush();
+    }
     readback.waiting = true;
     inflight_readbacks.push_back(&readback);
     SotcStats::readback_finish.fetch_add(1, std::memory_order_relaxed);
@@ -1444,6 +1450,23 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
         const SotcStats::SplitTimer copy_split{SotcStats::SplitTexCopy};
         return ObtainBuffer(device_addr, size, false);
     }
+    // sotc: SOTC_TEX_DIRECT: the GPU reads the texture in the game's memory itself.
+    if (SotcStats::kTexDirect && Vulkan::SotcGuestMemory::Enabled()) {
+        VAddr run_start = 0;
+        u64 run_size = 0;
+        const u8* run = memory->GetBackingRun(device_addr, &run_start, &run_size);
+        u64 offset = 0;
+        const Buffer* direct =
+            run && device_addr + size <= run_start + run_size
+                ? Vulkan::SotcGuestMemory::GetBuffer(run + (device_addr - run_start), size, &offset)
+                : nullptr;
+        if (direct && offset % std::max<u64>(instance.StorageMinAlignment(), 16) == 0) {
+            SotcStats::tex_direct_uploads.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::tex_direct_bytes.fetch_add(size, std::memory_order_relaxed);
+            return {direct, offset};
+        }
+        SotcStats::tex_direct_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    }
     const auto staging = [&] {
         const SotcStats::SplitTimer staging_split{SotcStats::SplitTexStaging};
         return staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
@@ -1780,6 +1803,11 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    // sotc: SOTC_RELEASE_DEFER: blocks used again before their release went: released now (the
+    // old way), so the deferred unbind cannot take them away from the new use later.
+    if (!pending_releases.empty()) {
+        ForcePendingReleases(first_block, last_block + 1);
+    }
     // sotc: binds check the same ranges thousands of times a frame, each a search of ~2,600
     // resident ranges (~2% of the command processor): ranges found resident are remembered
     // (64 slots by first block) until the resident set changes (resident_version).
@@ -2149,6 +2177,15 @@ void BufferCache::FreeArenaBlocks(vk::DeviceMemory memory, u64 start, u64 blocks
     scheduler.DeferOperation([device = instance.GetDevice(), memory] { device.freeMemory(memory); });
 }
 
+namespace {
+// sotc: SOTC_RELEASE_DEFER=1: an unmap's arena release waited for all queued GPU work
+// (scheduler.Finish) on the draw thread, 28-63 times a frame at area changes (10-20 ms a frame).
+const bool kReleaseDefer = [] {
+    const char* v = std::getenv("SOTC_RELEASE_DEFER");
+    return v && v[0] == '1';
+}();
+} // namespace
+
 void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     // Only whole blocks inside the unmapped range can go; partial blocks may back neighbours.
     const u64 first_block = Common::AlignUp(device_addr, u64{block_size}) >> block_shift;
@@ -2156,6 +2193,59 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     if (first_block >= end_block) {
         return;
     }
+    if (!kReleaseDefer) {
+        ReleaseBlocks(first_block, end_block, true);
+        scheduler.Flush();
+        return;
+    }
+    ProcessPendingReleases();
+    // The work recorded so far may still use the range: released once the GPU did it.
+    pending_releases.push_back({first_block, end_block, scheduler.CurrentTick()});
+    SotcStats::release_queued.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::release_pending_blocks.fetch_add(end_block - first_block, std::memory_order_relaxed);
+}
+
+void BufferCache::ProcessPendingReleases() {
+    if (pending_releases.empty()) {
+        return;
+    }
+    bool released = false;
+    std::erase_if(pending_releases, [&](const PendingRelease& pending) {
+        if (!scheduler.IsFree(pending.tick)) {
+            return false;
+        }
+        ReleaseBlocks(pending.first_block, pending.end_block, false);
+        SotcStats::release_done.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::release_pending_blocks.fetch_sub(pending.end_block - pending.first_block,
+                                                    std::memory_order_relaxed);
+        released = true;
+        return true;
+    });
+    if (released) {
+        // A bind of the same blocks must not share the unbinds' sparse batch (see ReleaseBlocks).
+        scheduler.Flush();
+    }
+}
+
+void BufferCache::ForcePendingReleases(u64 first_block, u64 end_block) {
+    bool released = false;
+    std::erase_if(pending_releases, [&](const PendingRelease& pending) {
+        if (pending.end_block <= first_block || end_block <= pending.first_block) {
+            return false;
+        }
+        ReleaseBlocks(pending.first_block, pending.end_block, !released);
+        SotcStats::release_forced.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::release_pending_blocks.fetch_sub(pending.end_block - pending.first_block,
+                                                    std::memory_order_relaxed);
+        released = true;
+        return true;
+    });
+    if (released) {
+        scheduler.Flush();
+    }
+}
+
+void BufferCache::ReleaseBlocks(u64 first_block, u64 end_block, bool finish) {
     evicted_ranges.Subtract(first_block, end_block);
     pinned_ranges.Subtract(first_block, end_block);
     boost::container::small_vector<Backing, 16> released;
@@ -2175,8 +2265,10 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     }
     // Work recorded before the unmap may still write this memory, and sparse binds are not
     // ordered against earlier submissions: finish that work before unbinding, or the GPU
-    // writes to unbound memory (WriteInvalid, device lost). Unmaps are rare, the sync is cheap.
-    scheduler.Finish();
+    // writes to unbound memory (WriteInvalid, device lost). (SOTC_RELEASE_DEFER: already done.)
+    if (finish) {
+        scheduler.Finish();
+    }
     // sotc: the deferred operations Finish ran (fault buffer rebinds) may have bound more of
     // the range, and their binds must not share the unbind's sparse batch.
     collect();
@@ -2197,8 +2289,7 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     }
     // sotc: a bind of the same blocks (the guest maps them again) must not share the unbind's
     // sparse bind batch: binds of one range within a batch are not ordered (the evicted blocks
-    // of MaybeEvictCold came back unbound: black scenes).
-    scheduler.Flush();
+    // of MaybeEvictCold came back unbound: black scenes). The caller flushes.
 }
 
 void BufferCache::UnbindResident(std::span<const Backing> released) {

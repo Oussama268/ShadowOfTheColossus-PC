@@ -291,6 +291,7 @@ extern "C" void runtime_memory_carve_stats(uint64_t* mib, uint64_t* runs, double
                                            double* worst_ms, double* other_ms);
 extern "C" void runtime_memory_lock_sites(char* readers, char* writers, size_t capacity);
 extern "C" void runtime_memory_cache_stats(uint64_t* misses, uint64_t* stale, uint64_t* fast);
+extern "C" uint64_t runtime_memory_clamp_gap_hits();
 // sotc: src/runtime_file.c, guest file read time since the last call.
 extern "C" uint64_t runtime_file_read_ns_take(void);
 
@@ -453,6 +454,7 @@ void VideoOutDriver::Flip(const Request& req) {
             split_worst[kSplitColumns]{}, split_slow[kSplitColumns]{};
         static double split_worst_ms = 0.0;
         static u32 split_frames = 0, split_slow_frames = 0;
+        static std::vector<std::string> slow_ops_lines; // sotc: SOTC_SLOW_OPS, printed per window
         static uint64_t split_tick0 = 0, split_ns0 = 0;
         if (SotcStats::kDrawSplit) {
             uint64_t current[kSplitColumns]{};
@@ -489,6 +491,50 @@ void VideoOutDriver::Flip(const Request& req) {
                 if (interval_ms > 40.0) {
                     ++split_slow_frames;
                     add(split_slow);
+                }
+            }
+            if (SotcStats::kSlowOps) {
+                std::unordered_map<uint64_t, SotcStats::SlowOp> ops;
+                {
+                    std::scoped_lock lock{SotcStats::slow_ops_mutex};
+                    ops.swap(SotcStats::slow_ops);
+                }
+                if (interval_ms > 40.0 && split_tick0 && slow_ops_lines.size() < 24) {
+                    const double ns = double(SotcStats::NowNs() - split_ns0);
+                    const double ticks_per_ms =
+                        ns > 0 ? (SotcStats::Ticks() - split_tick0) / (ns / 1e6) : 1.0;
+                    std::vector<std::pair<uint64_t, SotcStats::SlowOp>> top(ops.begin(), ops.end());
+                    std::ranges::sort(top, [](const auto& a, const auto& b) {
+                        return a.second.ticks > b.second.ticks;
+                    });
+                    uint64_t all = 0;
+                    for (const auto& [key, op] : top) {
+                        all += op.ticks;
+                    }
+                    static constexpr const char* kinds[] = {"func", "draw", "indirect", "dispatch",
+                                                            "dispatch-indirect"};
+                    std::string line = fmt::format("SOTC SLOW OPS frame {:.1f} ms, ops {:.1f} ms:",
+                                                   interval_ms, all / ticks_per_ms);
+                    for (size_t i = 0; i < top.size() && i < 8; ++i) {
+                        const auto& [key, op] = top[i];
+                        line += fmt::format(" {} {:#x} {:.1f} ms/{}", kinds[std::min<u64>(key >> 60, 4)],
+                                            key & ((u64{1} << 60) - 1), op.ticks / ticks_per_ms,
+                                            op.count);
+                    }
+                    const auto eop_ms = [&](SotcStats::EopPart part) {
+                        return SotcStats::eop_ticks[part].load(std::memory_order_relaxed) /
+                               ticks_per_ms;
+                    };
+                    line += fmt::format(
+                        " | labels {} ({} deferred): fence {:.1f}, invalidate {:.1f}, flush {:.1f} ms",
+                        SotcStats::eop_ticks[SotcStats::EopLabels].load(),
+                        SotcStats::eop_ticks[SotcStats::EopDeferred].load(),
+                        eop_ms(SotcStats::EopFence), eop_ms(SotcStats::EopInvalidate),
+                        eop_ms(SotcStats::EopFlush));
+                    slow_ops_lines.push_back(std::move(line));
+                }
+                for (auto& part : SotcStats::eop_ticks) {
+                    part.store(0, std::memory_order_relaxed);
                 }
             }
         }
@@ -622,6 +668,32 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(SotcStats::vram_budget.load() >> 20),
                          static_cast<unsigned long long>(SotcStats::arena_allocs.load()),
                          static_cast<unsigned long long>(SotcStats::arena_bytes.load() >> 20));
+            if (SotcStats::kVisDirect) {
+                ReportPrintf(report,
+                             "SOTC VIS DIRECT: %llu bitmaps written in the game's memory, %llu honest "
+                             "labels, %llu fallbacks\n",
+                             static_cast<unsigned long long>(SotcStats::vis_direct_binds.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::vis_honest_labels.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::vis_fallbacks.exchange(0)));
+            }
+            if (const u64 queued = SotcStats::release_queued.exchange(0)) {
+                ReportPrintf(report,
+                             "SOTC RELEASE DEFER: %llu queued, %llu after the GPU, %llu at once; "
+                             "%llu blocks waiting\n",
+                             static_cast<unsigned long long>(queued),
+                             static_cast<unsigned long long>(SotcStats::release_done.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::release_forced.exchange(0)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::release_pending_blocks.load()));
+            }
+            if (SotcStats::kTexDirect) {
+                ReportPrintf(report,
+                             "SOTC TEX DIRECT: %llu uploads read by the GPU in the game's memory "
+                             "(%llu MiB), %llu by copy\n",
+                             static_cast<unsigned long long>(SotcStats::tex_direct_uploads.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::tex_direct_bytes.exchange(0) >> 20),
+                             static_cast<unsigned long long>(SotcStats::tex_direct_fallbacks.exchange(0)));
+            }
             if (SotcStats::kRbAge) {
                 const auto c0 = SotcStats::rb_age_count[0].exchange(0);
                 const auto c1 = SotcStats::rb_age_count[1].exchange(0);
@@ -783,11 +855,12 @@ void VideoOutDriver::Flip(const Request& req) {
                     ReportPrintf(report,
                                  "SOTC memory lock sites: readers waited in %s; held in %s; "
                                  "region cache misses %llu, stale %llu, read without the lock "
-                                 "%llu\n",
+                                 "%llu, clamps past the mapping without the lock %llu\n",
                                  readers[0] ? readers : "-", writers[0] ? writers : "-",
                                  static_cast<unsigned long long>(misses),
                                  static_cast<unsigned long long>(stale),
-                                 static_cast<unsigned long long>(fast));
+                                 static_cast<unsigned long long>(fast),
+                                 static_cast<unsigned long long>(runtime_memory_clamp_gap_hits()));
                 }
             }
             if (const uint64_t deferred = SotcStats::upload_deferred.exchange(0)) {
@@ -923,14 +996,17 @@ void VideoOutDriver::Flip(const Request& req) {
                     using namespace SotcStats;
                     const auto ms = [&](int c) { return v[c] / ticks_per_ms / frames; };
                     constexpr int threads = SplitParts; // the thread columns follow the parts
-                    char text[1536];
+                    char text[2560];
                     std::snprintf(
                         text, sizeof(text),
                         "draw cpu %.1f ms (idle spin %.1f; idle %.1f), cp cpu %.1f, recorder cpu "
                         "%.1f; ops draw %.1f, indirect %.1f, dispatch %.1f, func %.1f, commands "
-                        "%.1f; bind %.1f [buffers %.1f, textures %.1f, dma %.1f]; texture uploads "
+                        "%.1f; bind %.1f [buffers %.1f (clamp %.1f, obtain %.1f), textures %.1f "
+                        "(desc %.1f, find %.1f, view %.1f), dma %.1f]; texture uploads "
                         "%.1f [hash %.1f, staging %.1f, copy %.1f (%.1f MB in %.0f copies, %.0f of "
-                        "2 MB+, %.0f page faults), detile %.1f, record %.1f]; "
+                        "2 MB+, %.0f page faults), detile %.1f, record %.1f]; guest readbacks "
+                        "on the draw thread [begin %.1f (submit %.1f), apply %.1f (dirty reread "
+                        "%.1f), %.1f handed back]; "
                         "draw waits gpu "
                         "%.1f, submit %.1f, recorder %.1f, frame %.1f; queue max %llu; guest "
                         "readback waits %.1f [queue %.1f, submit %.1f, gpu %.1f, finish %.1f]",
@@ -938,11 +1014,15 @@ void VideoOutDriver::Flip(const Request& req) {
                         ms(threads + SplitThreadCp), ms(threads + SplitThreadRecorder),
                         ms(SplitDraw), ms(SplitIndirect), ms(SplitDispatch), ms(SplitFunc),
                         ms(SplitCommands), ms(SplitBind), ms(SplitBindBuffers),
-                        ms(SplitBindTextures), ms(SplitBindDma), ms(SplitTexRefresh),
+                        ms(SplitBufClamp), ms(SplitBufObtain), ms(SplitBindTextures),
+                        ms(SplitTexDesc), ms(SplitTexFind), ms(SplitTexView), ms(SplitBindDma),
+                        ms(SplitTexRefresh),
                         ms(SplitTexHash), ms(SplitTexStaging), ms(SplitTexCopy),
                         v[SplitTexBytes] / 1048576.0 / frames, v[SplitTexCopies] / frames,
                         v[SplitTexBig] / frames, v[SplitTexFaults] / frames,
-                        ms(SplitTexDetile), ms(SplitTexRecord), ms(SplitWaitGpu),
+                        ms(SplitTexDetile), ms(SplitTexRecord), ms(SplitRbBegin),
+                        ms(SplitRbBeginFlush), ms(SplitRbApply), ms(SplitRbDirty),
+                        v[SplitRbRetries] / frames, ms(SplitWaitGpu),
                         ms(SplitWaitSubmit), ms(SplitWaitRecorder), ms(SplitWaitFrame),
                         static_cast<unsigned long long>(v[kSplitQueue]), v[SplitRbCount] / frames,
                         ms(SplitRbQueue), ms(SplitRbSubmit), ms(SplitRbGpu), ms(SplitRbFinish));
@@ -950,6 +1030,10 @@ void VideoOutDriver::Flip(const Request& req) {
                 };
                 std::fprintf(stderr, "SOTC DRAW SPLIT per frame (%u frames): %s\n", split_frames,
                              line(split_sum, split_frames).c_str());
+                for (const auto& slow_line : slow_ops_lines) {
+                    std::fprintf(stderr, "%s\n", slow_line.c_str());
+                }
+                slow_ops_lines.clear();
                 std::fprintf(stderr, "SOTC DRAW SPLIT worst frame %.1f ms: %s\n", split_worst_ms,
                              line(split_worst, 1.0).c_str());
                 if (split_slow_frames) {
@@ -1127,7 +1211,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
         liverpool->SendOrderedCommand(
-            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); }, 4);
     } else {
         SubmitFlipInternal(port, index, flip_arg, is_eop);
     }
@@ -1314,7 +1398,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             take_request = true;
         } else if (flip_rate <= 0) {
             const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
-            const u64 limit_vblanks = live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
+            u64 limit_vblanks = live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
+            // sotc: SOTC_FPS_DYNAMIC: the 60 FPS limit lowered while the game cannot keep it.
+            if (const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
+                dyn > 0 && limit_vblanks == vblanks_for(60)) {
+                limit_vblanks = vblanks_for(dyn); // the vblank grid's rounding; paced: exact
+            }
             const bool paced = SotcFpsCap::flip_pacer.load(std::memory_order_relaxed);
             if (limit_vblanks != 0 && !paced) {
                 take_request = vblank_status.count - last_flip_vblank >= limit_vblanks;
@@ -1325,7 +1414,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                                (now + tick_period / 2 >= last_flip_time + arrival_ema ||
                                 now >= *arrival + vblank_period);
                 if (take_request) {
-                    const auto limit_period = vblank_period * limit_vblanks;
+                    // sotc: the dynamic FPS step at its exact period (48 on a 144 Hz screen is not
+                    // a whole number of 120 Hz vblanks).
+                    const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
+                    const std::chrono::nanoseconds limit_period =
+                        dyn > 0 && limit_vblanks == vblanks_for(dyn)
+                            ? std::chrono::nanoseconds{1'000'000'000 / dyn}
+                            : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  vblank_period * limit_vblanks);
                     limit_next = (now - limit_next < tick_period ? limit_next : now) + limit_period;
                 }
             } else if (!paced) {
@@ -1366,6 +1462,57 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             prev_arrival = request.arrival;
             arrival_ema += (delta - arrival_ema) / 8;
             flipped = true;
+            // sotc: SOTC_FPS_DYNAMIC (sotc_fps_cap.h): the game's own frame interval decides.
+            if (SotcFpsCap::dynamic_low > 0 && flip_rate <= 0) {
+                enum class Dyn { High, Low, Probe };
+                static Dyn state = Dyn::High;
+                static std::chrono::nanoseconds slow{0}, total{0};
+                static auto since = last_flip_time;
+                const int live = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
+                const bool at_60 = (live >= 0 ? vblanks_for(live) : start_limit_vblanks) ==
+                                   vblanks_for(60);
+                // A frame counts as slow below 50 FPS: 50-60 FPS stays at the 60 limit (the step only
+                // takes over where the game really cannot keep up).
+                constexpr auto frame_60 = std::chrono::nanoseconds{1'000'000'000 / 50};
+                const auto set = [&](Dyn next, int limit) {
+                    state = next;
+                    since = last_flip_time;
+                    slow = total = std::chrono::nanoseconds{0};
+                    SotcFpsCap::dynamic_limit.store(limit, std::memory_order_relaxed);
+                    std::fprintf(stderr, "SOTC FPS DYNAMIC: %s\n",
+                                 next == Dyn::High   ? "60"
+                                 : next == Dyn::Low  ? "low"
+                                                     : "trying 60");
+                };
+                if (!at_60) {
+                    if (state != Dyn::High) {
+                        set(Dyn::High, 0);
+                    }
+                } else if (state == Dyn::High) {
+                    // Slow time builds up and drains back: a run of slow frames lowers it.
+                    slow = delta > frame_60 ? slow + delta
+                                            : std::max(std::chrono::nanoseconds{0}, slow - delta);
+                    if (slow > std::chrono::milliseconds{1500}) {
+                        set(Dyn::Low, SotcFpsCap::dynamic_low);
+                    }
+                } else if (state == Dyn::Low) {
+                    if (last_flip_time - since > std::chrono::seconds{10}) {
+                        set(Dyn::Probe, 0);
+                    }
+                } else { // Probe: 60 again for 2 s; back to low when over a quarter was slow
+                    total += delta;
+                    if (delta > frame_60) {
+                        slow += delta;
+                    }
+                    if (last_flip_time - since > std::chrono::seconds{2}) {
+                        if (slow * 4 > total) {
+                            set(Dyn::Low, SotcFpsCap::dynamic_low);
+                        } else {
+                            set(Dyn::High, 0);
+                        }
+                    }
+                }
+            }
             FRAME_END;
         }
 

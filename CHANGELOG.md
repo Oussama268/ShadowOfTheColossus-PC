@@ -1,23 +1,38 @@
 # Changelog
 
-## 0.72.1-opt13 — 2026-11-06
-- **Muito menos engasgos ao percorrer o mundo.** No teste de percurso (RTX 3060 Laptop, 5 minutos, modo 60 FPS),
-  comparado ao código da 0.70-opt12: quadros acima de 33 ms 515 → 205, acima de 50 ms 141 → 34, p99 50 → 35 ms,
-  pior quadro 233 → 152 ms, 50,8 → 52,7 FPS. Os quadros acima de 100 ms caíram pouco (12 → 9). Vem de menos travas
-  de memória na thread de desenho, do guarda do heap do jogo e de tabelas de memória em blocos.
-- **Colossos em cenas pesadas:** alvos de renderização temporários são reaproveitados em vez de recriados a cada
-  quadro. Colosso 13: 41,1 → 43,8 FPS e cerca de 60% menos quadros acima de 33 ms. Colosso 3: 41,5 → 42,8 FPS e
-  cerca de 30% menos. No percurso o ganho disso é pequeno. `SOTC_RT_STASH=0` desliga.
-- **Congelamento corrigido:** o jogo podia parar para sempre numa leitura de memória que falhava sem fim. O registro
-  da sessão agora nomeia esse caso (`SOTC FAULT LOOP`).
-- **Texturas pretas:** o limite de envio de texturas por quadro agora vem desligado. Uma textura adiada podia ficar
-  preta de vez. Quem preferir o limite antigo usa `SOTC_UPLOAD_BUDGET_MB=32`.
-- **Atraso de controle em 30 FPS** (#128): os quadros não se acumulam mais atrás do limitador (espera 261 → 48 ms).
-- **Erro 487 ao abrir** (#110): o jogo tenta de novo sozinho quando outro programa ocupa o endereço de que precisa.
-- **DLAA** no lançador: DLSS na resolução nativa, de tabnul. Consome mais memória de vídeo.
-- **Quedas raras corrigidas:** um formato de shader impossível não encerra mais o jogo, e uma falha aninhada dentro
-  do tratador de exceções agora aparece no registro em vez de fechar o jogo sem aviso.
-- O cache de shaders é refeito na primeira abertura, então a primeira sessão engasga mais.
+## 0.73 — 2026-11-09
+- **Final do jogo sem quedas:** os dois atalhos da guarda do heap (`SOTC_GUARD_STALE`, `SOTC_GUARD_USER_POINTER`), religados na 0.72, estragavam a memória do jogo no final (objetos zerados, alocador em `0x499cc`), como o T49 já suspeitava para a `0x49800`. Voltam a ficar desligados; com eles desligados o final e o pulo da intro passaram sem nenhuma queda e sem nada a reparar.
+- **Quedas no final do jogo (tela "Fim" e passagem para a intro) corrigidas do mesmo jeito que a `0x564d24`:** o jogo ia destruir um objeto cuja memória já estava zerada (`0x144c60`, `0x14934f`) ou soltar uma referência de um objeto inexistente (`0x14cce7`); o port pula esse objeto como o jogo faz quando ele não existe (`SOTC_FIX_NULL_OBJECTS=0` desliga).
+- **Mosaico no Time Attack corrigido** (vinha da correção do final, `SOTC_POOL_FREEZE`): ao entrar numa arena o jogo põe texturas novas onde estavam as antigas, e a correção mantinha o conteúdo antigo por 400 quadros. Agora um carregamento (save, área, arena) solta tudo o que ela segurava e ela não age nos 90 s seguintes; no final do jogo, onde ela é necessária, não há carregamento no meio.
+- **Jogo congelado na mesma imagem (FPS normal) corrigido:** o ponteiro de leitura da fila de compute, que fica na memória do jogo, era movido com escrita direta; quando o rastreamento de páginas da GPU protegia a página de novo antes da escrita repetir, ela falhava sem fim (`SOTC FAULT LOOP` em `ProcessCompute`), a fila de compute parava e o jogo congelava. Agora é escrito como os rótulos de fim de pipe, direto na memória do jogo (`SOTC_RPTR_BACKING=0` volta ao antigo).
+- **Queda `0x564d24` corrigida** (a mais frequente: 4 vezes desde 03/11, sempre 30–40 s depois de carregar um save): o jogo percorre uma lista de objetos e pede a cada um uma peça (eboot 0x660fc0), que vem vazia para um objeto apagado ou de outro tipo, e lia essa peça sem conferir. O item é pulado como o jogo pula um objeto que não existe (`SOTC_FIX_564D24=0` desliga).
+- **Exe compilado com ThinLTO e PGO, como o do Oussama268:** o perfil de uso foi gravado em duas voltas pelo mapa aberto (câmera girando, 60 FPS) e o compilador otimizou o que mais roda ali. O código era o mesmo e o FPS do nosso ficava abaixo do dele por isso; no teste do usuário ficou "igual ou melhor". (O perfil fica em `pgo/`, fora do repositório; `tools/pgo_train.sh` refaz.)
+- **FPS dinâmico (ligado por padrão no modo 60 FPS; caixa nos Ajustes rápidos):** quando o jogo fica abaixo de 50 FPS por 1,5 s o limite cai para um degrau que combina com a tela (48 em 144 Hz, 40 em 120 Hz, 30 em 60 Hz) e fica estável em vez de oscilar; a cada 10 s tenta 60 de novo. A lógica do jogo segue o tempo real, então não fica em câmera lenta.
+- **Junta a 0.72.1-opt13 do Oussama268:** muito menos engasgos ao percorrer o mundo (menos travas de memória na thread de desenho, guarda do heap do jogo e tabelas de memória em blocos), alvos de renderização temporários reaproveitados nos colossos pesados (`SOTC_RT_STASH`), leitura suja da GPU refeita pela própria thread do jogo (`SOTC_RB_REQUEUE`, no lugar do nosso `SOTC_RB_DIRTY_RETRY` experimental), limite de envio de texturas desligado (texturas pretas), quadros que não se acumulam atrás do limitador (atraso de controle a 30 FPS, #128), nova tentativa no erro 487 ao abrir (#110), DLAA no lançador e quedas raras corrigidas (formato SnormNz, falha aninhada no tratador de exceções). Nossa consulta de memória sem trava (`SOTC_CLAMP_GAP`) foi trocada pela dele (`SOTC_CLAMP_FAST`).
+- **Modo Extremo nítido de novo:** a 0.72.2 tinha posto Alta e Máxima no mip 2 e a Máxima (texturas do modo Extremo) ficou borrada. Voltam a Alta no mip 1 e a Máxima no mip 0 (perfil leve: Máxima 1, Alta 2), agora sem os 3 s de bancos mantidos e com a proteção do reservatório de páginas, que causavam as cópias de até 1,1 GB num quadro na floresta.
+
+## 0.72.2 — 2026-11-05
+- **Título da janela com a versão do port e o tempo de jogo:** `SHADOW OF THE COLOSSUS™ · v01.01 · Port v0.72.2 · 60 FPS · 0:12:34`.
+- **Atualizar o port limpa o cache de shaders uma vez** (o lançador guarda a versão que montou o cache em `user/cache/port_version.txt`): shaders montados pela versão anterior podiam conflitar com a nova. A primeira partida depois da atualização engasga um pouco enquanto o cache é refeito. O botão "Limpar cache de shaders" continua nas configurações.
+- **A queda forte de FPS na troca de área voltou na 0.72; corrigido.** As texturas mais finas que a 0.72
+  ligou (Alta no mip 1, Máxima no mip 0 com os bancos mantidos 3 s e sem a proteção do pool) faziam o jogo
+  copiar até 1,1 GB de texturas num quadro ao entrar numa área nova: pior quadro de 134–293 ms na entrada da
+  floresta, contra 58–75 ms na 0.70. Com o mip 1 sozinho o tranco continuava. Alta e Máxima voltam ao
+  comportamento da 0.71 (mip 2, sem os 3 s, com a proteção do pool): "muito mais suave, queda de 2–3 FPS por
+  2 s" no teste do usuário. Quem quiser as texturas mais finas pode usar `SOTC_LOD_LEVEL=1` ou `0` nas
+  variáveis extras.
+- **Troca de área: consulta da tabela de memória sem trava** para buffers que passam da área mapeada
+  (`SOTC_CLAMP_GAP=0` desliga) e **teto de 128 MB por quadro** para as texturas cujo adiamento venceu, que antes
+  subiam todas no mesmo quadro (`SOTC_UPLOAD_EXPIRED_MB`, 0 = sem teto).
+- **Diagnóstico (desligados):** `SOTC_DRAW_SPLIT=1` separa os binds (clamp, busca de buffer, decodificação,
+  busca de imagem e de view) e as leituras do jogo feitas na thread de desenho; `SOTC_RB_DIRTY_RETRY=1` devolve
+  à thread do jogo a releitura de uma leitura suja (experimental: uma queda em `0x94c71` numa das duas rodadas).
+- **Experimental (desligado): mapa de visibilidade direto na memória do jogo** (`SOTC_VIS_DIRECT=1` com `SOTC_PC_MEMORY=1`): os shaders que reescrevem o mapa que o jogo varre a cada quadro escrevem na memória do jogo, sem a leitura de volta da GPU. Com `SOTC_VIS_PROGRAMS=0x2e0f474b,0xf94d23d4,0x93aec24b,0x729c541e,0x4defcf7f` a entrada da floresta caiu de 31 para 14 quadros acima de 50 ms no teste do usuário. Diagnósticos `SOTC_SLOW_OPS=1` (shaders mais caros dos quadros lentos) e `tools/entry_report.py` (resumo do log por trecho).
+- **Experimental (desligado): texturas lidas pela GPU direto na memória do jogo** (`SOTC_TEX_DIRECT=1`, com `SOTC_PC_MEMORY=1` e `SOTC_PC_MEMORY_PREIMPORT=1`, que importa os 10 GB da memória do jogo no boot em ~2,6 s): sem a cópia pela CPU na primeira entrada de uma área. Entrada da floresta no teste do usuário: 14 → 9 quadros acima de 50 ms.
+- **Experimental (desligado): liberação de memória do unmap sem esperar a GPU inteira** (`SOTC_RELEASE_DEFER=1`): na troca de área cada liberação esperava todo o trabalho da GPU, 28–63 vezes por quadro (10–20 ms por quadro). **Corrigido também** o travamento ao carregar um save com `SOTC_VIS_DIRECT=1` (rótulos de fim de pipe escritos fora de ordem).
+- **Final do jogo sem texturas esticadas e sem fechar na passagem para a intro (ligado por padrão)** (`SOTC_POOL_FREEZE=1`, T51): no fim do jogo o jogo devolve a memória de texturas que ainda desenha; quando outra textura pega essa memória o port recarregava o conteúdo novo na textura ainda em uso (texturas esticadas, piscadas e a queda na passagem do final para a intro). Agora essas texturas ficam como estavam por 400 quadros.
+- **Menos memória de vídeo presa depois das trocas de área (ligado por padrão):** texturas de 2048×2048 ou mais têm memória própria e voltam ao driver quando saem; antes até 1,8 GB ficava reservado e vazio, passando do limite em placas de 8 GB (`SOTC_IMAGE_DEDICATED=0` desliga).
+- **Liberação de memória sem espera na troca de área e texturas lidas direto pela placa (ligados por padrão; as texturas diretas só com 24 GB de RAM ou mais).**
 
 ## 0.72.1 — 2026-11-03
 - **Placas com menos de 8 GB de memória de vídeo: perfil leve automático.** As melhorias de textura da 0.72

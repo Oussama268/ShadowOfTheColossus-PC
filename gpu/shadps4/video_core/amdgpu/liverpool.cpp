@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <utility>
+#include <unordered_map>
 #include <cstdlib>
 #include <deque>
 #include <mutex>
@@ -171,7 +172,59 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 : op.kind == DrawIndirect ? SotcStats::SplitIndirect
                 : op.kind == Func         ? SotcStats::SplitFunc
                                           : SotcStats::SplitDispatch};
+            const u64 op_start = SotcStats::kSlowOps ? SotcStats::Ticks() : 0;
+            // sotc: SOTC_SLOW_OPS: the split counters around one op, for the detail of a slow one.
+            static constexpr SotcStats::SplitPart kDetail[] = {
+                SotcStats::SplitBind,       SotcStats::SplitBindBuffers, SotcStats::SplitBufClamp,
+                SotcStats::SplitBufObtain,  SotcStats::SplitBindTextures, SotcStats::SplitTexView,
+                SotcStats::SplitTexRefresh, SotcStats::SplitTexCopy,      SotcStats::SplitBindDma,
+                SotcStats::SplitWaitGpu,    SotcStats::SplitWaitSubmit,   SotcStats::SplitRbApply,
+                SotcStats::SplitCommands,   SotcStats::SplitTexLock,      SotcStats::SplitTexTrack,
+                SotcStats::SplitTexMakeView};
+            u64 before[std::size(kDetail)]{};
+            if (SotcStats::kSlowOps) {
+                for (size_t i = 0; i < std::size(kDetail); ++i) {
+                    before[i] = SotcStats::split_ticks[kDetail[i]].load(std::memory_order_relaxed);
+                }
+            }
             ExecuteBackOp(op);
+            if (SotcStats::kSlowOps) {
+                // A Func op is keyed by the line that queued it.
+                const u64 hash = op.num_stages ? op.stages[0].info->pgm_hash
+                                               : (op.kind == BackOp::Kind::Func ? op.line : 0);
+                const u64 ticks = SotcStats::Ticks() - op_start;
+                SotcStats::NoteSlowOp((u64{static_cast<u8>(op.kind)} << 60) |
+                                          (hash & ((u64{1} << 60) - 1)),
+                                      ticks);
+                // An op over ~1 ms (3 GHz TSC; the line prints its real ms): where it went, the
+                // first 3 times per shader, 60 lines per session.
+                if (ticks > 3'000'000) {
+                    static std::unordered_map<u64, u32> shown;
+                    static u32 lines = 0;
+                    u32& n = shown[hash];
+                    if (n < 3 && lines < 60) {
+                        ++n;
+                        ++lines;
+                        u64 d[std::size(kDetail)];
+                        for (size_t i = 0; i < std::size(kDetail); ++i) {
+                            d[i] = SotcStats::split_ticks[kDetail[i]].load(
+                                       std::memory_order_relaxed) - before[i];
+                        }
+                        const double tpm = SotcStats::TicksPerMs();
+                        const auto ms = [&](size_t i) { return d[i] / tpm; };
+                        std::fprintf(stderr,
+                                     "SOTC SLOW OP kind %u %#llx %.2f ms: bind %.2f [buffers %.2f "
+                                     "(clamp %.2f, obtain %.2f), textures %.2f (view %.2f; uploads "
+                                     "%.2f, copy %.2f), dma %.2f]; waits gpu %.2f, submit %.2f; "
+                                     "readback apply %.2f, commands %.2f; stages %u; view: lock %.2f, "
+                                     "track %.2f, make %.2f\n",
+                                     u32(op.kind), static_cast<unsigned long long>(hash),
+                                     ticks / tpm, ms(0), ms(1), ms(2), ms(3), ms(4), ms(5), ms(6),
+                                     ms(7), ms(8), ms(9), ms(10), ms(11), ms(12), op.num_stages,
+                                     ms(13), ms(14), ms(15));
+                    }
+                }
+            }
         }
         op.func = {};
         ++tail;
@@ -255,9 +308,32 @@ void Liverpool::BackPublish(bool writes_memory) {
     }
 }
 
-void Liverpool::QueueBackFunc(Common::UniqueFunction<void>&& func, bool writes_memory) {
+namespace {
+// sotc: SOTC_VIS_DIRECT: labels written late (when the GPU got there) by address. A later label
+// to the same address must not be written before it: the late write would then put the older
+// value back and a game waiting for the newer one waits forever (hang on loading a save, 05/11).
+std::mutex g_late_labels_mutex;
+std::unordered_map<VAddr, u32> g_late_labels;
+bool LateLabelPending(VAddr label) {
+    std::scoped_lock lock{g_late_labels_mutex};
+    return g_late_labels.contains(label);
+}
+void LateLabelAdd(VAddr label) {
+    std::scoped_lock lock{g_late_labels_mutex};
+    ++g_late_labels[label];
+}
+void LateLabelDone(VAddr label) {
+    std::scoped_lock lock{g_late_labels_mutex};
+    if (const auto it = g_late_labels.find(label); it != g_late_labels.end() && --it->second == 0) {
+        g_late_labels.erase(it);
+    }
+}
+} // namespace
+
+void Liverpool::QueueBackFunc(Common::UniqueFunction<void>&& func, bool writes_memory, u32 line) {
     BackOp& op = BackAlloc();
     op.kind = BackOp::Kind::Func;
+    op.line = line;
     op.func = std::move(func);
     BackPublish(writes_memory);
 }
@@ -421,6 +497,7 @@ void Liverpool::SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 siz
 }
 
 void Liverpool::WriteFenceValue(void* address, u64 data, u32 num_bytes) {
+    const SotcStats::EopTimer invalidate_timer{SotcStats::EopInvalidate};
     // The value is written to the backing memory directly (the GPU may target pages the guest
     // mapped read-only), which the memory tracker cannot see. Invalidate first so a copy of the
     // page already uploaded to the GPU is not reused with the old value, and so GPU-written data
@@ -453,13 +530,16 @@ void Liverpool::ProcessCommands() {
         }
         while (num_ordered) {
             Common::UniqueFunction<void> callback{};
+            u32 tag = 3;
             {
                 std::scoped_lock lk{submit_mutex};
                 callback = std::move(ordered_queue.front());
                 ordered_queue.pop();
+                tag = ordered_tags.front();
+                ordered_tags.pop();
                 --num_ordered;
             }
-            QueueBackFunc(std::move(callback), back_strict);
+            QueueBackFunc(std::move(callback), back_strict, tag);
         }
         return;
     }
@@ -1219,7 +1299,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 BackOrRun([this, eop_packet] {
                 const auto* event_eop = &eop_packet;
+                if (SotcStats::kSlowOps) {
+                    SotcStats::eop_ticks[SotcStats::EopLabels].fetch_add(1, std::memory_order_relaxed);
+                }
                 if (rasterizer) {
+                    const SotcStats::EopTimer fence_timer{SotcStats::EopFence};
                     rasterizer->OnFence();
                 }
                 // sotc: an end-of-pipe label means "the GPU finished everything before it". It
@@ -1234,14 +1318,31 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const char* v = std::getenv("SOTC_EOP_DEFER");
                     return v && v[0] == '1';
                 }();
-                if (defer_eop && rasterizer) {
+                // sotc: SOTC_VIS_DIRECT: the label after a bitmap written in the game's memory waits
+                // for the GPU (the game reads the bitmap once it sees the label).
+                const bool vis_honest = std::exchange(SotcStats::vis_label_pending, false);
+                if (vis_honest) {
+                    SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
+                }
+                const VAddr eop_label = reinterpret_cast<VAddr>(event_eop->Address<void>());
+                const bool after_late =
+                    SotcStats::kVisDirect && !vis_honest && LateLabelPending(eop_label);
+                if ((defer_eop || vis_honest || after_late) && rasterizer) {
                     const PM4CmdEventWriteEop eop = *event_eop;
-                    const VAddr label = reinterpret_cast<VAddr>(eop.Address<void>());
+                    const VAddr label = eop_label;
+                    if (SotcStats::kVisDirect) {
+                        LateLabelAdd(label);
+                    }
                     // A GPU copy of the label's page must not be reused with the old value.
+                    if (SotcStats::kSlowOps) {
+                        SotcStats::eop_ticks[SotcStats::EopDeferred].fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
                     if (eop.data_sel.Value() != DataSelect::None) {
+                        const SotcStats::EopTimer invalidate_timer{SotcStats::EopInvalidate};
                         rasterizer->InvalidateMemory(label, 8, true);
                     }
-                    rasterizer->GetScheduler().DeferPriorityOperation([eop] {
+                    rasterizer->GetScheduler().DeferPriorityOperation([eop, label] {
                         eop.SignalFence(
                             [](void* address, u64 data, u32 num_bytes) {
                                 ASSERT(Core::Memory::Instance()->TryWriteBacking(address, &data,
@@ -1250,9 +1351,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             [] {
                                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                             });
+                        if (SotcStats::kVisDirect) {
+                            LateLabelDone(label);
+                        }
                     });
                     // Submit that work now: the game may wait for the label before it sends
                     // anything else, and nothing else would submit it.
+                    const SotcStats::EopTimer flush_timer{SotcStats::EopFlush};
                     rasterizer->Flush();
                     return;
                 }
@@ -1503,6 +1608,33 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     FIBER_EXIT;
 }
 
+// sotc: the compute queue's read pointer lives in guest memory and the command processor moved it
+// with plain stores. When the page was write-protected by the GPU page tracking and protected
+// again before the store retried, the store faulted forever (SOTC FAULT LOOP: 4096+ writes at the
+// read pointer from ProcessCompute, 9 Nov): the compute queue stopped and the game froze on the
+// same frame while flips went on. It is now written as fence values are (WriteFenceValue): the
+// GPU copy of those bytes invalidated, then the backing written directly, which no protection
+// stops. SOTC_RPTR_BACKING=0: plain stores.
+void Liverpool::AdvanceReadPointer(u32* read_addr, u32 dwords, u32 ring_size_dw) {
+    static const bool backing = [] {
+        const char* v = std::getenv("SOTC_RPTR_BACKING");
+        return !v || v[0] != '0';
+    }();
+    auto* memory = Core::Memory::Instance();
+    u32 value;
+    if (!backing || !memory->TryReadBacking(reinterpret_cast<VAddr>(read_addr), &value, 4)) {
+        *read_addr = (*read_addr + dwords) % ring_size_dw;
+        return;
+    }
+    value = (value + dwords) % ring_size_dw;
+    if (rasterizer) {
+        rasterizer->InvalidateMemory(reinterpret_cast<VAddr>(read_addr), 4, true);
+    }
+    if (!memory->TryWriteBacking(read_addr, &value, 4, 2)) {
+        *read_addr = value;
+    }
+}
+
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
@@ -1538,8 +1670,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
             queue.tmp_dwords = acb.size();
             if constexpr (!is_indirect) {
-                *queue.read_addr += acb.size();
-                *queue.read_addr %= queue.ring_size_dw;
+                AdvanceReadPointer(queue.read_addr, acb.size(), queue.ring_size_dw);
             }
             break;
         }
@@ -1549,8 +1680,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             next_dw_off = 1;
             acb = NextPacket(acb, next_dw_off);
             if constexpr (!is_indirect) {
-                *queue.read_addr += next_dw_off;
-                *queue.read_addr %= queue.ring_size_dw;
+                AdvanceReadPointer(queue.read_addr, next_dw_off, queue.ring_size_dw);
             }
             continue;
         }
@@ -1767,6 +1897,28 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
+                // sotc: SOTC_VIS_DIRECT: as the end-of-pipe label above (not for a GDS store, whose
+                // copy must be recorded here).
+                const VAddr release_label = reinterpret_cast<VAddr>(release.Address<u8*>());
+                if (rasterizer && release.data_sel.Value() != DataSelect::GdsMemStore &&
+                    (std::exchange(SotcStats::vis_label_pending, false) ||
+                     (SotcStats::kVisDirect && LateLabelPending(release_label)))) {
+                    SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
+                    const VAddr label = release_label;
+                    LateLabelAdd(label);
+                    rasterizer->InvalidateMemory(label, 8, true);
+                    rasterizer->GetScheduler().DeferPriorityOperation([release, pipe_id, label] {
+                        release.SignalFence(
+                            [pipe_id] {
+                                Platform::IrqC::Instance()->Signal(
+                                    static_cast<Platform::InterruptId>(pipe_id));
+                            },
+                            [](VAddr, u16, u16) {});
+                        LateLabelDone(label);
+                    });
+                    rasterizer->Flush();
+                    return;
+                }
                 release.SignalFence(
                     [pipe_id] {
                         Platform::IrqC::Instance()->Signal(
@@ -1791,8 +1943,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         acb = NextPacket(acb, next_dw_off);
 
         if constexpr (!is_indirect) {
-            *queue.read_addr += next_dw_off;
-            *queue.read_addr %= queue.ring_size_dw;
+            AdvanceReadPointer(queue.read_addr, next_dw_off, queue.ring_size_dw);
         }
     }
 

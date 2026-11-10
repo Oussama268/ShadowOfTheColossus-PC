@@ -2,6 +2,11 @@
 // sotc: counters printed with the frame rate (SOTC_FPS=1, videoout/driver.cpp).
 #pragma once
 #include <atomic>
+#include <algorithm>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <unordered_map>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -163,6 +168,98 @@ inline uint64_t NowNs() {
 /// printer reads the CPU time of the draw, command processor and recorder threads. Counting only:
 /// nothing else changes.
 inline const bool kDrawSplit = std::getenv("SOTC_DRAW_SPLIT") != nullptr;
+/// sotc: SOTC_VIS_DIRECT=1 (needs SOTC_PC_MEMORY=1; docs/sotc/MODELO-MEMORIA-PC.md steps 3 and 4):
+/// the compute shaders that write the visibility bitmaps the game scans every frame (eboot
+/// 0x1a6d60) write them straight into the game's memory (the imported backing view) instead of
+/// the arena, so the game's reads no longer fault and wait for a readback; the next end-of-pipe
+/// label after them is written when the GPU really got there. SOTC_VIS_PROGRAMS=hash,hash,...
+/// replaces the default list.
+inline const bool kVisDirect = [] {
+    const char* v = std::getenv("SOTC_VIS_DIRECT");
+    return v && v[0] == '1';
+}();
+inline bool VisDirectProgram(uint64_t hash) {
+    static const std::vector<uint64_t> programs = [] {
+        std::vector<uint64_t> out;
+        const char* v = std::getenv("SOTC_VIS_PROGRAMS");
+        std::string list = v ? v : "0x2e0f474b,0xf94d23d4,0x93aec24b,0x729c541e";
+        size_t pos = 0;
+        while (pos < list.size()) {
+            const size_t comma = list.find(',', pos);
+            const std::string item = list.substr(pos, comma == std::string::npos ? comma : comma - pos);
+            if (const uint64_t h = std::strtoull(item.c_str(), nullptr, 0)) {
+                out.push_back(h);
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+        return out;
+    }();
+    return std::find(programs.begin(), programs.end(), hash) != programs.end();
+}
+/// sotc: SOTC_TEX_DIRECT=1 (needs SOTC_PC_MEMORY=1): textures uploaded from the game's memory
+/// are copied by the GPU straight from the imported backing view, with no CPU copy into a staging
+/// buffer (the first-entry hitch: 3-18 ms per draw of memcpy and page faults on the draw thread).
+inline const bool kTexDirect = [] {
+    const char* v = std::getenv("SOTC_TEX_DIRECT");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint64_t> tex_direct_uploads{0}, tex_direct_bytes{0}, tex_direct_fallbacks{0};
+
+/// A dispatch of one of those wrote the game's memory directly since the last label: the next
+/// end-of-pipe label waits for the GPU (draw thread only).
+inline bool vis_label_pending = false;
+inline std::atomic<uint64_t> vis_direct_binds{0}, vis_honest_labels{0}, vis_fallbacks{0};
+
+/// sotc: SOTC_SLOW_OPS=1 (with SOTC_DRAW_SPLIT): the draw thread's operations of each frame summed
+/// by shader (kind and first stage's hash; Liverpool::BackLoop), and for each frame over 40 ms the
+/// 8 costliest printed with the window ("SOTC SLOW OPS" lines, videoout/driver.cpp).
+inline const bool kSlowOps = [] {
+    const char* v = std::getenv("SOTC_SLOW_OPS");
+    return v && v[0] == '1';
+}();
+struct SlowOp {
+    uint64_t ticks;
+    uint32_t count;
+};
+inline std::mutex slow_ops_mutex;
+inline std::unordered_map<uint64_t, SlowOp> slow_ops; ///< key: kind << 60 | pgm hash (60 bits)
+/// TSC ticks per millisecond, measured once against the steady clock (diagnostics only).
+inline double TicksPerMs() {
+    static const double value = [] {
+        const uint64_t t0 = __builtin_ia32_rdtsc();
+        const auto c0 = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - c0 < std::chrono::milliseconds(20)) {
+        }
+        const uint64_t t1 = __builtin_ia32_rdtsc();
+        return double(t1 - t0) /
+               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0)
+                   .count();
+    }();
+    return value;
+}
+/// SOTC_SLOW_OPS: inside the end-of-pipe label ops of the frame (ticks): OnFence, the label's
+/// invalidate, the deferred label's flush; and labels deferred (a count).
+enum EopPart { EopFence, EopInvalidate, EopFlush, EopDeferred, EopLabels, EopParts };
+inline std::atomic<uint64_t> eop_ticks[EopParts]{};
+struct EopTimer {
+    EopPart part;
+    uint64_t start;
+    explicit EopTimer(EopPart p) : part{p}, start{kSlowOps ? __builtin_ia32_rdtsc() : 0} {}
+    ~EopTimer() {
+        if (kSlowOps) {
+            eop_ticks[part].fetch_add(__builtin_ia32_rdtsc() - start, std::memory_order_relaxed);
+        }
+    }
+};
+inline void NoteSlowOp(uint64_t key, uint64_t ticks) {
+    std::scoped_lock lock{slow_ops_mutex};
+    SlowOp& op = slow_ops[key];
+    op.ticks += ticks;
+    ++op.count;
+}
 enum SplitPart {
     SplitDraw, SplitIndirect, SplitDispatch, SplitFunc, SplitCommands, // draw thread operations
     SplitBind, SplitBindBuffers, SplitBindTextures, SplitBindDma,      // inside BindResources
@@ -175,6 +272,17 @@ enum SplitPart {
     /// Texture copies from guest memory on the draw thread (counts, not ticks): bytes, copies,
     /// copies of 2 MiB and more (split across the copy threads), process page faults meanwhile.
     SplitTexBytes, SplitTexCopies, SplitTexBig, SplitTexFaults,
+    /// Inside the binds: buffer range clamp (memory table lookup), buffer cache lookup, texture
+    /// descriptor decode (T# -> image/view info), image lookup, view lookup.
+    SplitBufClamp, SplitBufObtain, SplitTexDesc, SplitTexFind, SplitTexView,
+    /// Guest readbacks on the draw thread: begin (gather the ranges, record the copies), its
+    /// submit, finish (apply to guest memory, heap guard included).
+    SplitRbBegin, SplitRbBeginFlush, SplitRbApply,
+    SplitRbDirty,   ///< inside the apply: a dirty readback read back again on the draw thread
+    SplitRbRetries, ///< dirty readbacks handed back to their guest thread (a count)
+    /// Inside the texture view lookup (FindTexture): the texture cache lock wait, page tracking
+    /// of the image (TrackImage), the view itself (Image::FindView).
+    SplitTexLock, SplitTexTrack, SplitTexMakeView,
     SplitParts
 };
 inline std::atomic<uint64_t> split_ticks[SplitParts]{};
@@ -244,6 +352,10 @@ inline std::atomic<uint64_t> images_new{0}, image_ns{0};
 inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicated{0};
 /// Video memory: usage the driver reports (texture cache GC), budget the GC works with, and the
 /// sparse buffer arena memory (never released) as allocations and bytes.
+/// SOTC_RELEASE_DEFER: unmap releases queued, released after the GPU, released at once (a bind
+/// used the blocks again), and the blocks still waiting (a gauge).
+inline std::atomic<uint64_t> release_queued{0}, release_done{0}, release_forced{0},
+    release_pending_blocks{0};
 inline std::atomic<uint64_t> vram_used{0}, vram_budget{0}, arena_allocs{0}, arena_bytes{0};
 /// sotc: host (not device-local) heaps: usage reported by the driver, and VMA's blocks in them.
 inline std::atomic<uint64_t> host_heap_usage{0}, host_vma_block_bytes{0};
