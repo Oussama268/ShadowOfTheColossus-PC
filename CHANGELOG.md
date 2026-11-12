@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.74.1-opt14 — 2026-11-12
+- **Inclui tudo do repositório principal da v0.72.2 até a v0.74.1** (final do jogo corrigido, trocas de área mais
+  suaves, FPS dinâmico, caminhos rápidos da thread de desenho, multiplicador do DLSS-G).
+- **Quedas em Radeon perto dos colossos 4 e 9** (#397, #408): com texturas em Alta ou Máxima, uma variante de um
+  shader declarava um buffer a mais que a primeira, e o pipeline dela era criado com um layout que não combinava;
+  os desenhos dela usavam todas as texturas uma posição fora do lugar. A NVIDIA tolera isso; é a causa provável
+  do driver da AMD recusar o pipeline. Achado com as camadas de validação do Vulkan. **Ainda não confirmado em
+  placas AMD.** Além disso, se o driver recusar um pipeline, o jogo registra, pula os desenhos dele e continua em
+  vez de fechar.
+- **Fechamento imediato com Control Flow Guard forçado no Windows** (#322): os limites de pilha do Windows agora
+  acompanham a pilha das fibras do jogo. Não é mais preciso criar uma exceção para o `bb-probe.exe`.
+- **Colosso 8:** um buffer de profundidade era enviado com o formato errado e a cópia lia além do fim dos dados
+  (em placas NVIDIA). A imagem não muda.
+- **Espaços de imagem vazios** de alguns shaders de computação eram escritos com o tipo errado.
+- Validação do Vulkan limpa em 15 dos 16 colossos (antes, 58 a 66 erros por execução nos colossos 4 e 9). No
+  colosso 6 resta um aviso numa cópia de profundidade.
+- Desempenho (RTX 3060 Laptop): percurso igual (cerca de 51 FPS); lutas com colossos de 1,5 a 2 FPS mais rápidas
+  (colosso 3: 42,3 → 44,4 FPS). Os engasgos no percurso não mudaram nesta versão.
+- **Atualização pelo lançador:** o pacote de um fork agora diz de onde ele se atualiza num arquivo do próprio
+  pacote (`launcher/update_repo.txt`, escrito pelo `package_sotc.sh` com `SOTC_UPDATE_REPO`). O código-fonte
+  sempre aponta para o repositório principal, então uma fusão não troca mais o endereço.
+- O cache de shaders é refeito na primeira abertura, então a primeira sessão engasga mais.
+
 ## 0.74.1 — 2026-11-10
 - **Atualização pelo lançador corrigida:** na fusão da 0.72.1-opt13 do Oussama268 (v0.73) o endereço das releases do atualizador (`launcher/sotc_update.py`) passou a ser o do fork dele, então os lançadores da v0.73 e da v0.74 procuravam atualização lá e nunca ofereciam a versão nova. Volta a ser este repositório, com um teste (`tests/test_update_repo.py`) que impede a troca de novo. Quem está na v0.73 ou na v0.74 precisa baixar a v0.74.1 à mão uma vez.
 
